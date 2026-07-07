@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 视频音量均衡脚本
-把视频里忽高忽低的声音拉平：整体响度统一到目标值，音量波动压缩到指定范围内。
+把视频里忽高忽低的声音变均衡：只把大声段压下去、小声段保持不动，
+最后整片以恒定增益统一到目标响度——环境音不会被逐段放大，听感自然。
 视频画面直接复制不重新编码，只处理音频，速度快、画质无损。
 
 用法：
-    py 响度均衡.py                      处理本文件夹里的所有视频
-    py 响度均衡.py 视频.mp4             处理指定文件（可以多个）
-    py 响度均衡.py 某个文件夹           处理该文件夹里的所有视频
-    py 响度均衡.py --mode gentle ...    温和模式（保留更多原始动态）
-    py 响度均衡.py --target -14 ...     自定义目标响度（LUFS）
+    python 响度均衡.py                      处理本文件夹里的所有视频
+    python 响度均衡.py 视频.mp4             处理指定文件（可以多个）
+    python 响度均衡.py 某个文件夹           处理该文件夹里的所有视频
+    python 响度均衡.py --target -14 ...     自定义目标响度（LUFS）
 """
 
 import argparse
@@ -24,11 +24,13 @@ from pathlib import Path
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".flv", ".ts", ".m4v", ".webm", ".wmv", ".mpg", ".mpeg"}
 OUTPUT_DIR_NAME = "输出"
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 def run(cmd, **kwargs):
     return subprocess.run(
-        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", **kwargs
+        cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+        cwd=SCRIPT_DIR, **kwargs
     )
 
 
@@ -46,49 +48,44 @@ def has_audio(path: Path) -> bool:
     return bool(r.stdout.strip())
 
 
-# 降噪放在音量提升之前：先在原始电平把噪声滤掉，再抬高的就是干净的人声
+# 降噪放在压缩之前：先在原始电平把稳定底噪滤掉
 DENOISE_FILTERS = {
     "off": "",
     "mid": "highpass=f=70,afftdn=nr=12:tn=1",
     "high": "highpass=f=80,afftdn=nr=20:tn=1,afftdn=nr=12:tn=1",
 }
-# dynaudnorm 的静音阈值：低于该电平的帧不做增益，避免把说话间隙的底噪抬响
-DYN_THRESHOLD = {"off": 0.008, "mid": 0.015, "high": 0.035}
+
+# 只压大声、不抬小声：增益只会往下动，环境音永远不会被逐段抬响，
+# 小声段与环境音的音量差整体由 loudnorm 的恒定增益统一提升
+# 两级压缩：慢速级抹段落差（阈值 -35dB≈0.0178），快速级压瞬时峰（-25dB≈0.0562）
+LEVELER = ("acompressor=threshold=0.0178:ratio=8:attack=50:release=800:knee=6,"
+           "acompressor=threshold=0.0562:ratio=4:attack=5:release=250:knee=4")
 
 
-def build_filter(mode: str, target: float, lra: float, tp: float, denoise: str,
+def build_filter(target: float, lra: float, tp: float, denoise: str,
                  measured: dict | None = None) -> str:
-    if measured and mode == "strong":
-        # strong 模式第二遍强制线性（全程恒定增益）：动态模式的 loudnorm 会把说话
-        # 间隙的底噪重新抬响；逐段抹平已由带阈值的 dynaudnorm 完成，这里只负责整体响度
-        lra_target = max(lra, min(50.0, float(measured["input_lra"]) + 1))
-        loudnorm = f"loudnorm=I={target}:LRA={lra_target}:TP={tp}:linear=true"
-    else:
-        loudnorm = f"loudnorm=I={target}:LRA={lra}:TP={tp}"
     if measured:
-        loudnorm += (
+        # 第二遍强制线性（全程恒定增益）：动态模式的 loudnorm 会把说话间隙的底噪
+        # 重新抬响；逐段的动态处理已由压缩器完成，这里只负责整体响度
+        lra_target = max(lra, min(50.0, float(measured["input_lra"]) + 1))
+        loudnorm = (
+            f"loudnorm=I={target}:LRA={lra_target}:TP={tp}:linear=true"
             f":measured_I={measured['input_i']}"
             f":measured_LRA={measured['input_lra']}"
             f":measured_TP={measured['input_tp']}"
             f":measured_thresh={measured['input_thresh']}"
         )
     else:
-        loudnorm += ":print_format=json"
-    if mode == "strong":
-        # 双通 dynaudnorm 抹平段落间的音量起伏（单通对突变段落反应不够快），loudnorm 再统一整体响度
-        t = DYN_THRESHOLD[denoise]
-        chain = f"dynaudnorm=f=200:g=11:t={t},dynaudnorm=f=200:g=11:t={t},{loudnorm}"
-    else:
-        chain = loudnorm
+        loudnorm = f"loudnorm=I={target}:LRA={lra}:TP={tp}:print_format=json"
     dn = DENOISE_FILTERS[denoise]
-    return f"{dn},{chain}" if dn else chain
+    return ",".join(p for p in (dn, LEVELER, loudnorm) if p)
 
 
-def measure(path: Path, mode: str, target: float, lra: float, tp: float, denoise: str) -> dict | None:
+def measure(path: Path, target: float, lra: float, tp: float, denoise: str) -> dict | None:
     """第一遍：跑完整滤镜链测量响度，解析 loudnorm 输出的 JSON。"""
     r = run([
         "ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
-        "-map", "0:a:0", "-af", build_filter(mode, target, lra, tp, denoise),
+        "-map", "0:a:0", "-af", build_filter(target, lra, tp, denoise),
         "-f", "null", "-",
     ])
     # loudnorm 的 JSON 打印在 stderr 末尾
@@ -121,8 +118,9 @@ def claim_out_path(path: Path, out_dir: Path, claimed: set[str], name_lock: thre
     return out_path
 
 
-def process(path: Path, out_dir: Path, mode: str, target: float, lra: float, tp: float,
-            denoise: str, claimed: set[str], name_lock: threading.Lock) -> tuple[bool, str]:
+def process(path: Path, out_dir: Path, target: float, lra: float, tp: float,
+            denoise: str, claimed: set[str],
+            name_lock: threading.Lock) -> tuple[bool, str]:
     """处理一个视频，返回 (是否成功, 汇总日志)。并行运行，日志攒齐后一次性打印。"""
     lines = [f"\n【{path.name}】"]
     announce(f">> 开始：{path.name}")
@@ -131,19 +129,18 @@ def process(path: Path, out_dir: Path, mode: str, target: float, lra: float, tp:
         lines.append("  跳过：这个文件没有音频。")
         return False, "\n".join(lines)
 
-    measured = measure(path, mode, target, lra, tp, denoise)
+    measured = measure(path, target, lra, tp, denoise)
     if measured is None:
         lines.append("  失败：无法分析响度，文件可能已损坏。")
         return False, "\n".join(lines)
-    label = "抹平起伏后" if mode == "strong" else "原片"
-    lines.append(f"  {label}响度：{measured['input_i']} LUFS，波动范围：{measured['input_lra']} LU")
+    lines.append(f"  压制大声段后响度：{measured['input_i']} LUFS，波动范围：{measured['input_lra']} LU")
 
     out_path = claim_out_path(path, out_dir, claimed, name_lock)
     r = run([
         "ffmpeg", "-hide_banner", "-nostats", "-y", "-i", str(path),
         "-map", "0:v?", "-map", "0:a:0",
         "-c:v", "copy",
-        "-af", build_filter(mode, target, lra, tp, denoise, measured),
+        "-af", build_filter(target, lra, tp, denoise, measured),
         "-c:a", "aac", "-b:a", "192k",
         str(out_path),
     ])
@@ -165,21 +162,20 @@ def collect_videos(args_paths: list[str], script_dir: Path) -> list[Path]:
     for src in sources:
         if src.is_dir():
             videos += sorted(
-                p for p in src.iterdir()
+                p.resolve() for p in src.iterdir()
                 if p.suffix.lower() in VIDEO_EXTS and p.parent.name != OUTPUT_DIR_NAME
             )
         elif src.is_file():
-            videos.append(src)
+            # ffmpeg 以脚本目录为工作目录运行，输入路径必须转成绝对路径
+            videos.append(src.resolve())
         else:
             print(f"警告：找不到 {src}，已跳过。")
     return videos
 
 
 def main():
-    parser = argparse.ArgumentParser(description="视频音量均衡：把忽高忽低的声音拉平。")
+    parser = argparse.ArgumentParser(description="视频音量均衡：压平大声段，环境音不会被逐段放大。")
     parser.add_argument("paths", nargs="*", help="视频文件或文件夹，不填则处理脚本所在文件夹")
-    parser.add_argument("--mode", choices=["strong", "gentle"], default="strong",
-                        help="strong=强力抹平音量起伏（默认），gentle=只统一整体响度、保留动态")
     parser.add_argument("--target", type=float, default=-16.0, help="目标响度 LUFS（默认 -16）")
     parser.add_argument("--lra", type=float, default=7.0, help="允许的响度波动范围 LU（默认 7）")
     parser.add_argument("--tp", type=float, default=-1.5, help="真峰值上限 dBTP（默认 -1.5）")
@@ -190,24 +186,23 @@ def main():
 
     check_ffmpeg()
 
-    script_dir = Path(__file__).resolve().parent
-    videos = collect_videos(args.paths, script_dir)
+    videos = collect_videos(args.paths, SCRIPT_DIR)
     if not videos:
         print("没有找到要处理的视频文件。把视频放进这个文件夹，或把文件拖到 响度均衡.bat 上。")
         return
 
     jobs = max(1, min(args.jobs, len(videos)))
-    print(f"共 {len(videos)} 个视频，并行 {jobs} 个，模式：{args.mode}，目标响度：{args.target} LUFS，"
-          f"波动范围：≤{args.lra} LU，降噪：{args.denoise}")
+    print(f"共 {len(videos)} 个视频，并行 {jobs} 个，目标响度：{args.target} LUFS，"
+          f"降噪：{args.denoise}")
 
-    out_dir = script_dir / OUTPUT_DIR_NAME
+    out_dir = SCRIPT_DIR / OUTPUT_DIR_NAME
     out_dir.mkdir(exist_ok=True)
     claimed: set[str] = set()
     name_lock = threading.Lock()
     ok = 0
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         futures = [
-            pool.submit(process, v, out_dir, args.mode, args.target, args.lra, args.tp,
+            pool.submit(process, v, out_dir, args.target, args.lra, args.tp,
                         args.denoise, claimed, name_lock)
             for v in videos
         ]
