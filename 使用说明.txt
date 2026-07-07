@@ -22,6 +22,7 @@
   python 响度均衡.py --lra 10 视频.mp4         允许更大的音量波动范围
   python 响度均衡.py --denoise high 视频.mp4   强力降噪（录音噪声明显时用）
   python 响度均衡.py --denoise off 视频.mp4    关闭降噪（音质干净的片源）
+  python 响度均衡.py --jobs 5 文件夹           同时处理 5 个（默认 3 个并行）
 
   默认设置：strong 模式，目标 -16 LUFS，波动范围 ≤7 LU，标准降噪，
   适合说话声忽大忽小的视频（课程、访谈、录屏等）。
