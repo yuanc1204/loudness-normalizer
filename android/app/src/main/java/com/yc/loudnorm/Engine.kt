@@ -47,22 +47,44 @@ object Engine {
         return powerMeanDb(if (v2.isEmpty()) v else v2)
     }
 
-    private val timelineRe = Regex(
-        """t:\s*([\d.]+)\s+TARGET.*?M:\s*(-?[\d.]+|nan)\s+S:\s*(-?[\d.]+|nan)(?:.*?FTPK:\s*([^d]*?)dBFS)?"""
-    )
+    /** 从下标 from 起跳过空格读一个浮点数；遇到 nan 返回 -120；读不到返回 null。 */
+    private fun readNum(s: String, from: Int): Double? {
+        var i = from
+        while (i < s.length && s[i] == ' ') i++
+        if (s.startsWith("nan", i) || s.startsWith("-inf", i) || s.startsWith("inf", i)) return -120.0
+        val start = i
+        while (i < s.length && (s[i].isDigit() || s[i] == '-' || s[i] == '.' || s[i] == '+')) i++
+        return if (i == start) null else s.substring(start, i).toDoubleOrNull()
+    }
 
-    /** 从 ebur128（peak=true）日志解析响度时间线，约每 0.1s 一个点。 */
-    fun parseTimeline(log: String): List<Pt> =
-        timelineRe.findAll(log).map { mr ->
-            val t = mr.groupValues[1].toDouble()
-            val m = mr.groupValues[2].let { if (it == "nan") -120.0 else it.toDouble() }
-            val s = mr.groupValues[3].let { if (it == "nan") -120.0 else it.toDouble() }
-            // FTPK 为该帧各声道的真峰值，取最大；静音显示 -inf
-            val tp = mr.groupValues[4].split(" ", "\t")
-                .mapNotNull { it.trim().toDoubleOrNull() }
-                .maxOrNull() ?: -120.0
-            Pt(t, m, s, tp)
-        }.toList()
+    /**
+     * 从 ebur128（peak=true）日志解析响度时间线，约每 0.1s 一个点。
+     * 逐行 + indexOf 解析，绝不用带 .*? 的整体正则——那在上万行日志上会灾难性回溯卡死。
+     */
+    fun parseTimeline(log: String): List<Pt> {
+        val out = ArrayList<Pt>(4096)
+        for (line in log.splitToSequence('\n')) {
+            val tIdx = line.indexOf("t:")
+            if (tIdx < 0 || !line.contains("TARGET")) continue
+            val t = readNum(line, tIdx + 2) ?: continue
+            val mIdx = line.indexOf("M:", tIdx)
+            val m = if (mIdx >= 0) readNum(line, mIdx + 2) ?: -120.0 else -120.0
+            val sIdx = if (mIdx >= 0) line.indexOf("S:", mIdx + 2) else -1
+            val s = if (sIdx >= 0) readNum(line, sIdx + 2) ?: -120.0 else -120.0
+            // FTPK: 后面是各声道真峰值，到 dBFS 为止，取最大
+            var tp = -120.0
+            val fIdx = line.indexOf("FTPK:")
+            if (fIdx >= 0) {
+                val end = line.indexOf("dBFS", fIdx).let { if (it >= 0) it else line.length }
+                for (tok in line.substring(fIdx + 5, end).trim().split(' ', '\t')) {
+                    val v = tok.toDoubleOrNull() ?: continue
+                    if (v > tp) tp = v
+                }
+            }
+            out.add(Pt(t, m, s, tp))
+        }
+        return out
+    }
 
     /** 按响度水平分段。以短时响度 S 持续偏离本段参考响度为分段信号，边界回溯吸附到响度拐点。 */
     fun makeSegments(pts: List<Pt>, target: Double, strength: Double): List<Seg> {

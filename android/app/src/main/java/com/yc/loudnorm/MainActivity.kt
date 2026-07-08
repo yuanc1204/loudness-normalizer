@@ -246,8 +246,9 @@ class MainActivity : AppCompatActivity() {
     private fun processOne(uri: Uri, name: String, target: Double, strength: Double): Boolean {
         currentDurationMs = durationMs(uri)
 
-        stage("第 1 步 / 共 3 步：扫描响度…")
+        stage("第 1 步 / 共 2 步：扫描响度…")
         scanPhase = true
+        val tScan = System.currentTimeMillis()
         val scan = FFmpegKit.executeWithArguments(
             arrayOf(
                 "-hide_banner", "-nostats",
@@ -260,6 +261,7 @@ class MainActivity : AppCompatActivity() {
             log("  失败：无法读取音频（文件可能没有声音轨）")
             return false
         }
+        log("  扫描用时 ${elapsed(tScan)}")
         val pts = Engine.parseTimeline(scan.allLogsAsString)
         if (pts.isEmpty()) {
             log("  失败：未取得响度数据")
@@ -278,53 +280,71 @@ class MainActivity : AppCompatActivity() {
         val measured = Engine.computeMeasured(pts, knots)
         log("  分段调整后响度：${measured.i} LUFS")
 
+        // 先在相册建占位项，让 ffmpeg 直接写进去，省掉"先写缓存再复制一遍"的整遍 IO
+        val base = name.substringBeforeLast('.')
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, "${base}_均衡.mp4")
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/响度均衡")
+            put(MediaStore.Video.Media.IS_PENDING, 1)
+        }
+        val outUri = contentResolver.insert(
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values
+        )
+        if (outUri == null) {
+            log("  失败：无法写入相册")
+            return false
+        }
+
         try {
-            stage("第 2 步 / 共 3 步：生成视频（画面直接复制）…")
-            val outTmp = File(cacheDir, "out_${System.currentTimeMillis()}.mp4")
-            val enc = FFmpegKit.executeWithArguments(
+            stage("第 2 步 / 共 2 步：生成并保存（画面直接复制）…")
+            val tGen = System.currentTimeMillis()
+            val filter = Engine.buildFilter(target, vol, measured)
+            // SAF 输出参数不带扩展名，必须显式 -f mp4
+            fun encodeTo(out: String) = FFmpegKit.executeWithArguments(
                 arrayOf(
                     "-hide_banner", "-y",
                     "-i", FFmpegKitConfig.getSafParameterForRead(this, uri),
                     "-map", "0:v?", "-map", "0:a:0",
                     "-c:v", "copy",
-                    "-af", Engine.buildFilter(target, vol, measured),
+                    "-af", filter,
                     "-c:a", "aac", "-b:a", "192k",
-                    outTmp.absolutePath,
+                    "-f", "mp4",
+                    out,
                 )
             )
-            if (!ReturnCode.isSuccess(enc.returnCode) || !outTmp.exists()) {
+
+            // 主路径：直接写相册，省一遍 IO
+            var enc = encodeTo(FFmpegKitConfig.getSafParameterForWrite(this, outUri))
+            // 个别机型的相册输出流不可 seek，mp4 封装会失败，回退到"先写缓存再复制"
+            if (!ReturnCode.isSuccess(enc.returnCode) &&
+                enc.allLogsAsString.contains("non seekable")
+            ) {
+                val tmp = File(cacheDir, "out_${System.currentTimeMillis()}.mp4")
+                enc = encodeTo(tmp.absolutePath)
+                if (ReturnCode.isSuccess(enc.returnCode) && tmp.exists()) {
+                    contentResolver.openOutputStream(outUri)!!.use { os ->
+                        tmp.inputStream().use { it.copyTo(os) }
+                    }
+                }
+                tmp.delete()
+            }
+            if (!ReturnCode.isSuccess(enc.returnCode)) {
                 log("  失败：ffmpeg 处理出错：")
                 log("  " + enc.allLogsAsString.lines().takeLast(5).joinToString("\n  "))
-                outTmp.delete()
+                contentResolver.delete(outUri, null, null)
                 return false
-            }
-
-            stage("第 3 步 / 共 3 步：保存到相册…")
-            val base = name.substringBeforeLast('.')
-            val values = ContentValues().apply {
-                put(MediaStore.Video.Media.DISPLAY_NAME, "${base}_均衡.mp4")
-                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/响度均衡")
-                put(MediaStore.Video.Media.IS_PENDING, 1)
-            }
-            val outUri = contentResolver.insert(
-                MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values
-            )
-            if (outUri == null) {
-                log("  失败：无法写入相册")
-                outTmp.delete()
-                return false
-            }
-            contentResolver.openOutputStream(outUri)!!.use { os ->
-                outTmp.inputStream().use { it.copyTo(os) }
             }
             values.clear()
             values.put(MediaStore.Video.Media.IS_PENDING, 0)
             contentResolver.update(outUri, values, null, null)
-            outTmp.delete()
 
+            log("  生成用时 ${elapsed(tGen)}")
             log("  完成 → Movies/响度均衡/${base}_均衡.mp4")
             return true
+        } catch (e: Exception) {
+            contentResolver.delete(outUri, null, null)
+            throw e
         } finally {
             cmdFile.delete()
         }
