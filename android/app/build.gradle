@@ -1,0 +1,42 @@
+plugins {
+    id 'com.android.application'
+    id 'org.jetbrains.kotlin.android'
+}
+
+android {
+    namespace 'com.yc.loudnorm'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.yc.loudnorm"
+        minSdk 29
+        targetSdk 34
+        versionCode 2
+        versionName "1.1"
+        ndk {
+            // 只保留手机常见架构，控制 APK 体积
+            abiFilters 'arm64-v8a', 'armeabi-v7a'
+        }
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+    kotlinOptions {
+        jvmTarget = '17'
+    }
+}
+
+dependencies {
+    // ffmpeg-kit 官方已停止维护，此为 Maven Central 上的社区镜像（包名改为 com.antonkarpenko.ffmpegkit）
+    implementation 'com.antonkarpenko:ffmpeg-kit-min:2.1.0'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'androidx.core:core-ktx:1.13.1'
+    implementation 'com.google.android.material:material:1.12.0'
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
+}
