@@ -1,9 +1,6 @@
 # 输出文件夹
 输出/
 
-# DeepFilterNet 可执行文件（脚本会自动下载）
-deep-filter.exe
-
 __pycache__/
 
 # 视频文件（原始素材，不入库）
