@@ -21,6 +21,12 @@
   python 响度均衡.py --denoise high 视频.mp4   强力降噪（录音噪声明显时用）
   python 响度均衡.py --denoise off 视频.mp4    关闭降噪（音质干净的片源）
   python 响度均衡.py --jobs 5 文件夹           同时处理 5 个（默认 3 个并行）
+  python 响度均衡.py --denoise dfn 视频.mp4    DeepFilterNet 神经网络降噪：
+                                           压环境音、保人声（含呼吸声等 ASMR 类
+                                           声音），输出为单声道。
+                                           环境音最多被压 --atten-lim dB（默认 10），
+                                           人声就算被误判，损失也不会超过这个数；
+                                           调大压得狠（如 --atten-lim 20），调小更保险
 
   默认设置：目标 -16 LUFS，标准降噪，3 个并行。
 

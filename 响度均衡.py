@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -25,6 +26,9 @@ from pathlib import Path
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".flv", ".ts", ".m4v", ".webm", ".wmv", ".mpg", ".mpeg"}
 OUTPUT_DIR_NAME = "输出"
 SCRIPT_DIR = Path(__file__).resolve().parent
+# DeepFilterNet 神经网络降噪（--denoise dfn 用），独立 exe，无需装 Python 依赖
+DFN_EXE = SCRIPT_DIR / "deep-filter.exe"
+DFN_URL = "https://github.com/Rikorose/DeepFilterNet/releases/download/v0.5.6/deep-filter-0.5.6-x86_64-pc-windows-msvc.exe"
 
 
 def run(cmd, **kwargs):
@@ -40,6 +44,43 @@ def check_ffmpeg():
         sys.exit(1)
 
 
+def ensure_dfn_exe():
+    if DFN_EXE.exists():
+        return
+    print("首次使用 dfn 降噪，正在下载 deep-filter.exe（约 26MB）……")
+    try:
+        import urllib.request
+        urllib.request.urlretrieve(DFN_URL, DFN_EXE)
+        print("下载完成。")
+    except Exception as e:
+        print(f"错误：下载失败（{e}）。\n请手动下载 {DFN_URL}\n保存为 {DFN_EXE} 后重试。")
+        sys.exit(1)
+
+
+def dfn_denoise(path: Path, atten_lim: float, tmpdir: Path, lines: list[str]) -> Path | None:
+    """用 DeepFilterNet 对音频降噪：抽成 48kHz 单声道 wav → deep-filter → 返回降噪后的 wav。"""
+    in_dir = tmpdir / "in"
+    out_dir = tmpdir / "out"
+    in_dir.mkdir()
+    out_dir.mkdir()
+    wav = in_dir / "a.wav"
+    r = run([
+        "ffmpeg", "-hide_banner", "-nostats", "-y", "-i", str(path),
+        "-map", "0:a:0", "-ac", "1", "-ar", "48000", "-c:a", "pcm_s16le", str(wav),
+    ])
+    if r.returncode != 0 or not wav.exists():
+        lines.append("  失败：无法抽取音频。")
+        return None
+    # -D 补偿模型引入的延迟，避免音画不同步
+    r = run([str(DFN_EXE), "-D", "-a", str(atten_lim), "-o", str(out_dir), str(wav)])
+    denoised = out_dir / wav.name
+    if r.returncode != 0 or not denoised.exists():
+        tail = "\n    ".join((r.stderr or r.stdout or "").strip().splitlines()[-3:])
+        lines.append(f"  失败：deep-filter 降噪出错：\n    {tail}")
+        return None
+    return denoised
+
+
 def has_audio(path: Path) -> bool:
     r = run([
         "ffprobe", "-v", "error", "-select_streams", "a",
@@ -49,10 +90,12 @@ def has_audio(path: Path) -> bool:
 
 
 # 降噪放在压缩之前：先在原始电平把稳定底噪滤掉
+# dfn 档不走 ffmpeg 滤镜，由 deep-filter.exe 预处理音频（见 dfn_denoise）
 DENOISE_FILTERS = {
     "off": "",
     "mid": "highpass=f=70,afftdn=nr=12:tn=1",
     "high": "highpass=f=80,afftdn=nr=20:tn=1,afftdn=nr=12:tn=1",
+    "dfn": "",
 }
 
 # 只压大声、不抬小声：增益只会往下动，环境音永远不会被逐段抬响，
@@ -119,7 +162,7 @@ def claim_out_path(path: Path, out_dir: Path, claimed: set[str], name_lock: thre
 
 
 def process(path: Path, out_dir: Path, target: float, lra: float, tp: float,
-            denoise: str, claimed: set[str],
+            denoise: str, atten_lim: float, claimed: set[str],
             name_lock: threading.Lock) -> tuple[bool, str]:
     """处理一个视频，返回 (是否成功, 汇总日志)。并行运行，日志攒齐后一次性打印。"""
     lines = [f"\n【{path.name}】"]
@@ -129,21 +172,34 @@ def process(path: Path, out_dir: Path, target: float, lra: float, tp: float,
         lines.append("  跳过：这个文件没有音频。")
         return False, "\n".join(lines)
 
-    measured = measure(path, target, lra, tp, denoise)
-    if measured is None:
-        lines.append("  失败：无法分析响度，文件可能已损坏。")
-        return False, "\n".join(lines)
-    lines.append(f"  压制大声段后响度：{measured['input_i']} LUFS，波动范围：{measured['input_lra']} LU")
+    with tempfile.TemporaryDirectory(prefix="loudnorm_") as td:
+        # dfn 档先用神经网络把音频降噪成干净的 wav，后续均衡处理以它为音频源
+        if denoise == "dfn":
+            audio_src = dfn_denoise(path, atten_lim, Path(td), lines)
+            if audio_src is None:
+                return False, "\n".join(lines)
+        else:
+            audio_src = path
 
-    out_path = claim_out_path(path, out_dir, claimed, name_lock)
-    r = run([
-        "ffmpeg", "-hide_banner", "-nostats", "-y", "-i", str(path),
-        "-map", "0:v?", "-map", "0:a:0",
-        "-c:v", "copy",
-        "-af", build_filter(target, lra, tp, denoise, measured),
-        "-c:a", "aac", "-b:a", "192k",
-        str(out_path),
-    ])
+        measured = measure(audio_src, target, lra, tp, denoise)
+        if measured is None:
+            lines.append("  失败：无法分析响度，文件可能已损坏。")
+            return False, "\n".join(lines)
+        lines.append(f"  压制大声段后响度：{measured['input_i']} LUFS，波动范围：{measured['input_lra']} LU")
+
+        out_path = claim_out_path(path, out_dir, claimed, name_lock)
+        cmd = ["ffmpeg", "-hide_banner", "-nostats", "-y", "-i", str(path)]
+        if audio_src is path:
+            cmd += ["-map", "0:v?", "-map", "0:a:0"]
+        else:
+            cmd += ["-i", str(audio_src), "-map", "0:v?", "-map", "1:a:0"]
+        cmd += [
+            "-c:v", "copy",
+            "-af", build_filter(target, lra, tp, denoise, measured),
+            "-c:a", "aac", "-b:a", "192k",
+            str(out_path),
+        ]
+        r = run(cmd)
     if r.returncode != 0 or not out_path.exists():
         tail = "\n    ".join(r.stderr.strip().splitlines()[-5:])
         lines.append(f"  失败：ffmpeg 处理出错：\n    {tail}")
@@ -179,12 +235,17 @@ def main():
     parser.add_argument("--target", type=float, default=-16.0, help="目标响度 LUFS（默认 -16）")
     parser.add_argument("--lra", type=float, default=7.0, help="允许的响度波动范围 LU（默认 7）")
     parser.add_argument("--tp", type=float, default=-1.5, help="真峰值上限 dBTP（默认 -1.5）")
-    parser.add_argument("--denoise", choices=["off", "mid", "high"], default="mid",
-                        help="降噪强度：off=不降噪，mid=标准（默认），high=强力（噪声大的录音用）")
+    parser.add_argument("--denoise", choices=["off", "mid", "high", "dfn"], default="mid",
+                        help="降噪强度：off=不降噪，mid=标准（默认），high=强力（噪声大的录音用），"
+                             "dfn=DeepFilterNet 神经网络降噪（保人声压环境音，ASMR 类内容用）")
+    parser.add_argument("--atten-lim", type=float, default=10.0,
+                        help="dfn 档的环境音最大衰减量 dB（默认 10，越大压得越狠，100=不设限）")
     parser.add_argument("--jobs", type=int, default=3, help="同时处理几个视频（默认 3）")
     args = parser.parse_args()
 
     check_ffmpeg()
+    if args.denoise == "dfn":
+        ensure_dfn_exe()
 
     videos = collect_videos(args.paths, SCRIPT_DIR)
     if not videos:
@@ -203,7 +264,7 @@ def main():
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         futures = [
             pool.submit(process, v, out_dir, args.target, args.lra, args.tp,
-                        args.denoise, claimed, name_lock)
+                        args.denoise, args.atten_lim, claimed, name_lock)
             for v in videos
         ]
         for fut in as_completed(futures):
