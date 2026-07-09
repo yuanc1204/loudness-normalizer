@@ -47,6 +47,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var sbStrength: SeekBar
     private lateinit var pbFile: ProgressBar
     private lateinit var cbRepair: CheckBox
+    private lateinit var cbConcat: CheckBox
 
     private data class PickedFile(val uri: Uri, val name: String)
 
@@ -93,6 +94,7 @@ class MainActivity : AppCompatActivity() {
         sbStrength = findViewById(R.id.sbStrength)
         pbFile = findViewById(R.id.pbFile)
         cbRepair = findViewById(R.id.cbRepair)
+        cbConcat = findViewById(R.id.cbConcat)
 
         sbTarget.setOnSeekBarChangeListener(simpleSeek {
             tvTarget.text = "目标响度：${targetLufs().toInt()} LUFS"
@@ -103,7 +105,11 @@ class MainActivity : AppCompatActivity() {
         cbRepair.setOnCheckedChangeListener { _, checked ->
             sbTarget.isEnabled = !checked && !busy
             sbStrength.isEnabled = !checked && !busy
-            btnStart.text = if (checked) "开始修复" else "开始处理"
+            updateStartText()
+        }
+        cbConcat.setOnCheckedChangeListener { _, _ ->
+            updateStartText()
+            refreshFileList()
         }
 
         btnPick.setOnClickListener { pickVideos.launch(arrayOf("video/*")) }
@@ -166,17 +172,41 @@ class MainActivity : AppCompatActivity() {
     private fun targetLufs() = -20.0 + sbTarget.progress          // 0..8 → -20..-12
     private fun strength() = (50 + sbStrength.progress) / 100.0   // 0..50 → 0.5..1.0
 
+    private fun updateStartText() {
+        btnStart.text = when {
+            cbConcat.isChecked && cbRepair.isChecked -> "开始拼接（不调音量）"
+            cbConcat.isChecked -> "拼接并均衡"
+            cbRepair.isChecked -> "开始修复"
+            else -> "开始处理"
+        }
+    }
+
     private fun simpleSeek(onChange: () -> Unit) = object : SeekBar.OnSeekBarChangeListener {
         override fun onProgressChanged(sb: SeekBar?, p: Int, fromUser: Boolean) = onChange()
         override fun onStartTrackingTouch(sb: SeekBar?) {}
         override fun onStopTrackingTouch(sb: SeekBar?) {}
     }
 
-    /** 已选文件列表：文件名 + 删除按钮。 */
+    /** 交换列表中 i 和 i+delta 两项的顺序（拼接顺序即列表顺序）。 */
+    private fun moveFile(i: Int, delta: Int) {
+        val j = i + delta
+        if (busy || i !in picked.indices || j !in picked.indices) return
+        val t = picked[i]; picked[i] = picked[j]; picked[j] = t
+        refreshFileList()
+    }
+
+    /** 已选文件列表：文件名 + ↑↓ 排序（多个文件时）+ 删除按钮。 */
     private fun refreshFileList() {
         llFiles.removeAllViews()
         val dp = resources.displayMetrics.density
-        for (pf in picked.toList()) {
+        fun iconBtn(label: String, enabled: Boolean, onClick: () -> Unit) = TextView(this).apply {
+            text = label
+            textSize = 16f
+            alpha = if (enabled) 1f else 0.25f
+            setPadding((10 * dp).toInt(), (4 * dp).toInt(), (10 * dp).toInt(), (4 * dp).toInt())
+            if (enabled) setOnClickListener { onClick() }
+        }
+        for ((i, pf) in picked.withIndex()) {
             val row = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
                 gravity = Gravity.CENTER_VERTICAL
@@ -188,18 +218,17 @@ class MainActivity : AppCompatActivity() {
                 ellipsize = TextUtils.TruncateAt.MIDDLE
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             }
-            val del = TextView(this).apply {
-                text = "✕"
-                textSize = 16f
-                setPadding((12 * dp).toInt(), (4 * dp).toInt(), (12 * dp).toInt(), (4 * dp).toInt())
-                setOnClickListener {
-                    if (busy) return@setOnClickListener
+            row.addView(tv)
+            if (picked.size > 1) {
+                row.addView(iconBtn("↑", i > 0) { moveFile(i, -1) })
+                row.addView(iconBtn("↓", i < picked.size - 1) { moveFile(i, +1) })
+            }
+            row.addView(iconBtn("✕", true) {
+                if (!busy) {
                     picked.remove(pf)
                     refreshFileList()
                 }
-            }
-            row.addView(tv)
-            row.addView(del)
+            })
             llFiles.addView(row)
         }
         // 超过 5 个时列表内滚动，避免挤掉下面的日志区
@@ -229,6 +258,7 @@ class MainActivity : AppCompatActivity() {
         sbTarget.isEnabled = !b && !cbRepair.isChecked
         sbStrength.isEnabled = !b && !cbRepair.isChecked
         cbRepair.isEnabled = !b
+        cbConcat.isEnabled = !b
         pbFile.visibility = if (b) View.VISIBLE else View.INVISIBLE
         if (b) {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -242,12 +272,26 @@ class MainActivity : AppCompatActivity() {
         val target = targetLufs()
         val strength = strength()
         val repair = cbRepair.isChecked
+        val concat = cbConcat.isChecked && picked.size >= 2
         val files = picked.toList()
         setUiBusy(true)
         tvLog.text = ""
         lifecycleScope.launch(Dispatchers.IO) {
             var ok = 0
             val t0 = System.currentTimeMillis()
+            if (concat) {
+                log("【拼接 ${files.size} 个视频】")
+                try {
+                    if (concatOne(files, repair, target, strength)) ok++
+                } catch (e: Exception) {
+                    log("  失败：${e.message}")
+                }
+                log("")
+                log(if (ok > 0) "拼接完成，总耗时 ${elapsed(t0)}。" else "拼接失败。")
+                if (ok > 0) log("成品在相册（或文件管理器）的 Movies/响度均衡 文件夹里。")
+                withContext(Dispatchers.Main) { setUiBusy(false) }
+                return@launch
+            }
             for ((idx, pf) in files.withIndex()) {
                 log("【${pf.name}】(${idx + 1}/${files.size})")
                 val ft0 = System.currentTimeMillis()
@@ -355,17 +399,90 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** 无损拼接：把 concat 列表文件里的视频按顺序合并（-c copy），输出到 out。 */
+    private fun runConcat(listPath: String, out: String): FFmpegSession =
+        FFmpegKit.executeWithArguments(
+            arrayOf(
+                "-hide_banner", "-y",
+                "-f", "concat", "-safe", "0",
+                "-i", listPath,
+                "-map", "0:v?", "-map", "0:a?",
+                "-c", "copy",
+                "-avoid_negative_ts", "make_zero",
+                "-f", "mp4",
+                out,
+            )
+        )
+
+    /**
+     * 拼接所有视频。repair=true 时只无损拼接（拼接本身就是重新封装，顺带修复卡顿）；
+     * 否则拼到缓存后再对合并结果做响度均衡。
+     * 注意：concat 分段切换时关闭 saf 输入会原生崩溃（saf_close），
+     * 所以输入必须先复制成缓存里的真实文件，不能用 saf 协议直读。
+     */
+    private fun concatOne(
+        files: List<PickedFile>, repair: Boolean, target: Double, strength: Double,
+    ): Boolean {
+        currentDurationMs = files.sumOf { durationMs(it.uri) }
+        val outBase = files.first().name.substringBeforeLast('.') + "_等${files.size}个拼接"
+        val stamp = System.currentTimeMillis()
+        val listFile = File(cacheDir, "concat_$stamp.txt")
+        val tmpCopies = mutableListOf<File>()
+        try {
+            stage("准备中：复制视频到缓存…")
+            for ((i, pf) in files.withIndex()) {
+                val f = File(cacheDir, "cat_${stamp}_$i.mp4")
+                contentResolver.openInputStream(pf.uri)!!.use { ins ->
+                    f.outputStream().use { ins.copyTo(it) }
+                }
+                tmpCopies.add(f)
+            }
+            listFile.writeText(tmpCopies.joinToString("") { "file '${it.absolutePath}'\n" })
+
+            stage("拼接中（无损，不重编码）…")
+            if (repair) {
+                return encodeToGallery("$outBase.mp4") { out ->
+                    runConcat(listFile.absolutePath, out)
+                }
+            }
+            // 先无损拼到缓存，再走正常均衡流程
+            val merged = File(cacheDir, "merged_$stamp.mp4")
+            try {
+                val s = runConcat(listFile.absolutePath, merged.absolutePath)
+                if (!ReturnCode.isSuccess(s.returnCode)) {
+                    log("  失败：拼接出错（各视频的编码/分辨率需一致）：")
+                    log("  " + s.allLogsAsString.lines().takeLast(5).joinToString("\n  "))
+                    return false
+                }
+                // 输入副本用完即删，给均衡阶段腾缓存空间
+                tmpCopies.forEach { it.delete() }
+                return processInput({ merged.absolutePath }, "$outBase.mp4", target, strength)
+            } finally {
+                merged.delete()
+            }
+        } finally {
+            listFile.delete()
+            tmpCopies.forEach { it.delete() }
+        }
+    }
+
     /** 完整处理一个视频：扫描（含真峰值）→ 本地计算测量值 → 编码 → 存入相册。 */
     private fun processOne(uri: Uri, name: String, target: Double, strength: Double): Boolean {
         currentDurationMs = durationMs(uri)
+        return processInput({ FFmpegKitConfig.getSafParameterForRead(this, uri) }, name, target, strength)
+    }
 
+    /** 响度均衡主流程。input 每次调用返回一个可用的 ffmpeg 输入（saf 参数或缓存文件路径）。 */
+    private fun processInput(
+        input: () -> String, name: String, target: Double, strength: Double,
+    ): Boolean {
         stage("第 1 步 / 共 2 步：扫描响度…")
         scanPhase = true
         val tScan = System.currentTimeMillis()
         val scan = FFmpegKit.executeWithArguments(
             arrayOf(
                 "-hide_banner", "-nostats",
-                "-i", FFmpegKitConfig.getSafParameterForRead(this, uri),
+                "-i", input(),
                 "-map", "0:a:0", "-af", "ebur128=peak=true", "-f", "null", "-",
             )
         )
@@ -402,7 +519,7 @@ class MainActivity : AppCompatActivity() {
                 FFmpegKit.executeWithArguments(
                     arrayOf(
                         "-hide_banner", "-y",
-                        "-i", FFmpegKitConfig.getSafParameterForRead(this, uri),
+                        "-i", input(),
                         "-map", "0:v?", "-map", "0:a:0",
                         "-c:v", "copy",
                         "-af", filter,

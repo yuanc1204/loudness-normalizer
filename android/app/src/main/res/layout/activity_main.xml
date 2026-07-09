@@ -83,6 +83,14 @@
         android:progress="35" />
 
     <CheckBox
+        android:id="@+id/cbConcat"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="拼接：按列表顺序合并成一个视频（↑↓ 调顺序）"
+        android:textSize="13sp" />
+
+    <CheckBox
         android:id="@+id/cbRepair"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
