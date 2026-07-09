@@ -9,7 +9,9 @@ import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.text.TextUtils
 import android.view.Gravity
+import android.view.MotionEvent
 import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.CheckBox
@@ -21,6 +23,9 @@ import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
+import androidx.recyclerview.widget.ItemTouchHelper
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
 import com.antonkarpenko.ffmpegkit.FFmpegKit
 import com.antonkarpenko.ffmpegkit.FFmpegKitConfig
 import com.antonkarpenko.ffmpegkit.FFmpegSession
@@ -41,8 +46,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvStage: TextView
     private lateinit var tvLog: TextView
     private lateinit var svLog: ScrollView
-    private lateinit var svFiles: ScrollView
-    private lateinit var llFiles: LinearLayout
+    private lateinit var rvFiles: RecyclerView
     private lateinit var sbTarget: SeekBar
     private lateinit var sbStrength: SeekBar
     private lateinit var pbFile: ProgressBar
@@ -88,8 +92,10 @@ class MainActivity : AppCompatActivity() {
         tvStage = findViewById(R.id.tvStage)
         tvLog = findViewById(R.id.tvLog)
         svLog = findViewById(R.id.svLog)
-        svFiles = findViewById(R.id.svFiles)
-        llFiles = findViewById(R.id.llFiles)
+        rvFiles = findViewById(R.id.rvFiles)
+        rvFiles.layoutManager = LinearLayoutManager(this)
+        rvFiles.adapter = fileAdapter
+        touchHelper.attachToRecyclerView(rvFiles)
         sbTarget = findViewById(R.id.sbTarget)
         sbStrength = findViewById(R.id.sbStrength)
         pbFile = findViewById(R.id.pbFile)
@@ -187,54 +193,88 @@ class MainActivity : AppCompatActivity() {
         override fun onStopTrackingTouch(sb: SeekBar?) {}
     }
 
-    /** 交换列表中 i 和 i+delta 两项的顺序（拼接顺序即列表顺序）。 */
-    private fun moveFile(i: Int, delta: Int) {
-        val j = i + delta
-        if (busy || i !in picked.indices || j !in picked.indices) return
-        val t = picked[i]; picked[i] = picked[j]; picked[j] = t
-        refreshFileList()
-    }
+    private class FileVH(row: LinearLayout, val handle: TextView, val name: TextView, val del: TextView) :
+        RecyclerView.ViewHolder(row)
 
-    /** 已选文件列表：文件名 + ↑↓ 排序（多个文件时）+ 删除按钮。 */
-    private fun refreshFileList() {
-        llFiles.removeAllViews()
-        val dp = resources.displayMetrics.density
-        fun iconBtn(label: String, enabled: Boolean, onClick: () -> Unit) = TextView(this).apply {
-            text = label
-            textSize = 16f
-            alpha = if (enabled) 1f else 0.25f
-            setPadding((10 * dp).toInt(), (4 * dp).toInt(), (10 * dp).toInt(), (4 * dp).toInt())
-            if (enabled) setOnClickListener { onClick() }
-        }
-        for ((i, pf) in picked.withIndex()) {
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
+    /** 已选文件列表：按住 ≡ 拖动排序（拼接顺序即列表顺序），✕ 删除。 */
+    private val fileAdapter: RecyclerView.Adapter<FileVH> = object : RecyclerView.Adapter<FileVH>() {
+        override fun getItemCount() = picked.size
+
+        override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): FileVH {
+            val dp = parent.resources.displayMetrics.density
+            fun icon(label: String, size: Float) = TextView(parent.context).apply {
+                text = label
+                textSize = size
+                setPadding((10 * dp).toInt(), (6 * dp).toInt(), (10 * dp).toInt(), (6 * dp).toInt())
             }
-            val tv = TextView(this).apply {
-                text = pf.name
+            val handle = icon("≡", 18f)
+            val name = TextView(parent.context).apply {
                 textSize = 13f
                 maxLines = 1
                 ellipsize = TextUtils.TruncateAt.MIDDLE
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             }
-            row.addView(tv)
-            if (picked.size > 1) {
-                row.addView(iconBtn("↑", i > 0) { moveFile(i, -1) })
-                row.addView(iconBtn("↓", i < picked.size - 1) { moveFile(i, +1) })
+            val del = icon("✕", 16f)
+            val row = LinearLayout(parent.context).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                layoutParams = RecyclerView.LayoutParams(
+                    RecyclerView.LayoutParams.MATCH_PARENT, RecyclerView.LayoutParams.WRAP_CONTENT
+                )
+                addView(handle)
+                addView(name)
+                addView(del)
             }
-            row.addView(iconBtn("✕", true) {
-                if (!busy) {
-                    picked.remove(pf)
-                    refreshFileList()
-                }
-            })
-            llFiles.addView(row)
+            return FileVH(row, handle, name, del)
         }
+
+        override fun onBindViewHolder(h: FileVH, position: Int) {
+            h.name.text = picked[position].name
+            h.handle.visibility = if (picked.size > 1) View.VISIBLE else View.GONE
+            h.handle.setOnTouchListener { v, ev ->
+                if (ev.actionMasked == MotionEvent.ACTION_DOWN && !busy) {
+                    touchHelper.startDrag(h)
+                    v.performClick()
+                }
+                false
+            }
+            h.del.setOnClickListener {
+                val pos = h.bindingAdapterPosition
+                if (busy || pos == RecyclerView.NO_POSITION) return@setOnClickListener
+                picked.removeAt(pos)
+                refreshFileList()
+            }
+        }
+    }
+
+    /** 拖动排序：长按整行或按住 ≡ 即可拖。 */
+    private val touchHelper: ItemTouchHelper = ItemTouchHelper(object : ItemTouchHelper.SimpleCallback(
+        ItemTouchHelper.UP or ItemTouchHelper.DOWN, 0
+    ) {
+        override fun onMove(
+            rv: RecyclerView, vh: RecyclerView.ViewHolder, target: RecyclerView.ViewHolder,
+        ): Boolean {
+            if (busy) return false
+            val from = vh.bindingAdapterPosition
+            val to = target.bindingAdapterPosition
+            if (from == RecyclerView.NO_POSITION || to == RecyclerView.NO_POSITION) return false
+            val t = picked[from]; picked[from] = picked[to]; picked[to] = t
+            fileAdapter.notifyItemMoved(from, to)
+            return true
+        }
+
+        override fun onSwiped(vh: RecyclerView.ViewHolder, direction: Int) {}
+        override fun isLongPressDragEnabled() = !busy
+    })
+
+    @Suppress("NotifyDataSetChanged")
+    private fun refreshFileList() {
+        fileAdapter.notifyDataSetChanged()
         // 超过 5 个时列表内滚动，避免挤掉下面的日志区
-        svFiles.layoutParams = svFiles.layoutParams.apply {
+        val dp = resources.displayMetrics.density
+        rvFiles.layoutParams = rvFiles.layoutParams.apply {
             height = if (picked.size > 5) (170 * dp).toInt()
-            else LinearLayout.LayoutParams.WRAP_CONTENT
+            else ViewGroup.LayoutParams.WRAP_CONTENT
         }
         tvSelected.text = if (picked.isEmpty()) "未选择视频" else "已选择 ${picked.size} 个视频"
         btnStart.isEnabled = picked.isNotEmpty() && !busy

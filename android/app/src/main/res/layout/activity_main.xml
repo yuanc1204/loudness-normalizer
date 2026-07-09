@@ -41,18 +41,11 @@
         android:text="未选择视频"
         android:textSize="13sp" />
 
-    <ScrollView
-        android:id="@+id/svFiles"
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/rvFiles"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="4dp">
-
-        <LinearLayout
-            android:id="@+id/llFiles"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="vertical" />
-    </ScrollView>
+        android:layout_marginTop="4dp" />
 
     <TextView
         android:id="@+id/tvTarget"
@@ -87,7 +80,7 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="4dp"
-        android:text="拼接：按列表顺序合并成一个视频（↑↓ 调顺序）"
+        android:text="拼接：按列表顺序合并成一个视频（拖 ≡ 排序）"
         android:textSize="13sp" />
 
     <CheckBox
