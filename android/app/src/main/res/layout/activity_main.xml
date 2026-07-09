@@ -27,6 +27,13 @@
         android:text="选择视频" />
 
     <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="也可在 Telegram 等 App 里分享视频到「响度均衡」"
+        android:textSize="12sp" />
+
+    <TextView
         android:id="@+id/tvSelected"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
@@ -75,11 +82,19 @@
         android:max="50"
         android:progress="35" />
 
+    <CheckBox
+        android:id="@+id/cbRepair"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="仅修复播放卡顿（不调音量，无损秒级）"
+        android:textSize="13sp" />
+
     <Button
         android:id="@+id/btnStart"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
+        android:layout_marginTop="4dp"
         android:enabled="false"
         android:text="开始处理" />
 

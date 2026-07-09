@@ -11,8 +11,8 @@ android {
         applicationId "com.yc.loudnorm"
         minSdk 29
         targetSdk 34
-        versionCode 4
-        versionName "1.3"
+        versionCode 7
+        versionName "1.6"
         ndk {
             // 只保留手机常见架构，控制 APK 体积
             abiFilters 'arm64-v8a', 'armeabi-v7a'
