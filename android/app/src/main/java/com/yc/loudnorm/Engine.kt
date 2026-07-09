@@ -47,42 +47,47 @@ object Engine {
         return powerMeanDb(if (v2.isEmpty()) v else v2)
     }
 
-    /** 从下标 from 起跳过空格读一个浮点数；遇到 nan 返回 -120；读不到返回 null。 */
-    private fun readNum(s: String, from: Int): Double? {
-        var i = from
-        while (i < s.length && s[i] == ' ') i++
-        if (s.startsWith("nan", i) || s.startsWith("-inf", i) || s.startsWith("inf", i)) return -120.0
-        val start = i
-        while (i < s.length && (s[i].isDigit() || s[i] == '-' || s[i] == '.' || s[i] == '+')) i++
-        return if (i == start) null else s.substring(start, i).toDoubleOrNull()
+    private fun metaNum(line: String, from: Int): Double {
+        val v = line.substring(from).trim().toDoubleOrNull()
+        return if (v != null && v.isFinite()) v else -120.0
     }
 
     /**
-     * 从 ebur128（peak=true）日志解析响度时间线，约每 0.1s 一个点。
-     * 逐行 + indexOf 解析，绝不用带 .*? 的整体正则——那在上万行日志上会灾难性回溯卡死。
+     * 从 ametadata=print:file= 写出的扫描文件解析响度时间线，约每 0.1s 一个点。
+     * 走文件而不是刮 ffmpeg 日志：并行跑多路时日志管道可能丢行，文件是确定可靠的。
+     * 注意 true_peaks_ch* 是"开播至今最大真峰值"（线性幅度），不是逐帧峰值；
+     * 用它算 measured_TP 只会偏保守（增益换算后取 max 再封顶 -1 dB），不会引起过载。
      */
-    fun parseTimeline(log: String): List<Pt> {
+    fun parseMetadata(text: String): List<Pt> {
         val out = ArrayList<Pt>(4096)
-        for (line in log.splitToSequence('\n')) {
-            val tIdx = line.indexOf("t:")
-            if (tIdx < 0 || !line.contains("TARGET")) continue
-            val t = readNum(line, tIdx + 2) ?: continue
-            val mIdx = line.indexOf("M:", tIdx)
-            val m = if (mIdx >= 0) readNum(line, mIdx + 2) ?: -120.0 else -120.0
-            val sIdx = if (mIdx >= 0) line.indexOf("S:", mIdx + 2) else -1
-            val s = if (sIdx >= 0) readNum(line, sIdx + 2) ?: -120.0 else -120.0
-            // FTPK: 后面是各声道真峰值，到 dBFS 为止，取最大
-            var tp = -120.0
-            val fIdx = line.indexOf("FTPK:")
-            if (fIdx >= 0) {
-                val end = line.indexOf("dBFS", fIdx).let { if (it >= 0) it else line.length }
-                for (tok in line.substring(fIdx + 5, end).trim().split(' ', '\t')) {
-                    val v = tok.toDoubleOrNull() ?: continue
-                    if (v > tp) tp = v
+        var t = -1.0
+        var m = -120.0
+        var s = -120.0
+        var tp = -120.0
+        fun flush() {
+            if (t >= 0) out.add(Pt(t, m, s, tp))
+        }
+        for (line in text.splitToSequence('\n')) {
+            when {
+                line.startsWith("frame:") -> {
+                    flush()
+                    val i = line.indexOf("pts_time:")
+                    t = if (i >= 0) line.substring(i + 9).trim().toDoubleOrNull() ?: -1.0 else -1.0
+                    m = -120.0; s = -120.0; tp = -120.0
+                }
+                line.startsWith("lavfi.r128.M=") -> m = metaNum(line, 13)
+                line.startsWith("lavfi.r128.S=") -> s = metaNum(line, 13)
+                line.startsWith("lavfi.r128.true_peaks_ch") -> {
+                    val eq = line.indexOf('=')
+                    val v = if (eq >= 0) line.substring(eq + 1).trim().toDoubleOrNull() else null
+                    if (v != null && v > 0) {
+                        val db = 20 * log10(v)
+                        if (db > tp) tp = db
+                    }
                 }
             }
-            out.add(Pt(t, m, s, tp))
         }
+        flush()
         return out
     }
 
@@ -179,11 +184,14 @@ object Engine {
     /**
      * 直接从扫描数据算出 loudnorm 需要的四个测量值，省掉整整一遍解码。
      * I 按 BS.1770 门限能量平均，LRA 按 EBU Tech 3342（P95-P10），
-     * 真峰值取逐帧 FTPK+增益的最大值并按限幅器上限封顶。与真测相比误差约 ±0.5 dB。
+     * 真峰值取逐点峰值+增益的最大值并按限幅器上限封顶。与真测相比误差约 ±0.5 dB。
+     * 四个值都钳到 loudnorm 选项的合法范围——越界会让整条滤镜链在建图时报
+     * ERANGE（"Math result not representable"）直接失败。
      */
     fun computeMeasured(pts: List<Pt>, knots: List<Pair<Double, Double>>): Measured {
         val gains = pts.map { gainAt(knots, it.t) }
         val i = gatedLoudness(pts.mapIndexed { k, p -> p.m + gains[k] })
+            .coerceIn(-99.0, 0.0)
         val sShift = pts.mapIndexedNotNull { k, p -> if (p.s > -110) p.s + gains[k] else null }
         val v = sShift.filter { it > -70 }
         val lra = if (v.size < 2) 0.0 else {
@@ -199,9 +207,11 @@ object Engine {
                 pct(0.95) - pct(0.10)
             }
         }
-        val tp = min(pts.mapIndexed { k, p -> p.tp + gains[k] }.max(), -1.0)
+        val lraC = lra.coerceIn(0.0, 99.0)
+        val tp = pts.mapIndexed { k, p -> p.tp + gains[k] }.max()
+            .coerceIn(-99.0, -1.0)
         fun f(d: Double) = String.format(java.util.Locale.US, "%.2f", d)
-        return Measured(f(i), f(lra), f(tp), f(i - 10))
+        return Measured(f(i), f(lraC), f(tp), f((i - 10).coerceIn(-99.0, 0.0)))
     }
 
     /**

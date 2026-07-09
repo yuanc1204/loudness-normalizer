@@ -31,9 +31,14 @@ import com.antonkarpenko.ffmpegkit.FFmpegKitConfig
 import com.antonkarpenko.ffmpegkit.FFmpegSession
 import com.antonkarpenko.ffmpegkit.ReturnCode
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.util.concurrent.CountDownLatch
 import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
@@ -59,15 +64,9 @@ class MainActivity : AppCompatActivity() {
     private var busy = false
 
     @Volatile
-    private var currentDurationMs: Long = 0
-
-    // 扫描阶段进度靠解析 ebur128 日志里的时间戳（-f null 输出没有编码统计）
-    @Volatile
-    private var scanPhase = false
-
-    @Volatile
     private var lastPct = -1
 
+    // 扫描阶段进度靠解析 ebur128 日志里的时间戳（-f null 输出没有编码统计）
     private val tLineRe = Regex("""t:\s*([\d.]+)\s+TARGET""")
 
     private val pickVideos =
@@ -121,18 +120,6 @@ class MainActivity : AppCompatActivity() {
         btnPick.setOnClickListener { pickVideos.launch(arrayOf("video/*")) }
         btnStart.setOnClickListener { startProcessing() }
 
-        // 编码阶段的进度（time 为已处理的毫秒数）
-        FFmpegKitConfig.enableStatisticsCallback { st ->
-            if (!scanPhase) setProgressMs(st.time.toDouble())
-        }
-        // 扫描阶段的进度：从 ebur128 日志行解析时间戳
-        FFmpegKitConfig.enableLogCallback { l ->
-            if (scanPhase) {
-                val m = tLineRe.find(l.message ?: return@enableLogCallback)
-                if (m != null) setProgressMs(m.groupValues[1].toDouble() * 1000)
-            }
-        }
-
         handleShareIntent(intent)
     }
 
@@ -165,14 +152,39 @@ class MainActivity : AppCompatActivity() {
         refreshFileList()
     }
 
-    private fun setProgressMs(ms: Double) {
-        val dur = currentDurationMs
-        if (dur <= 0) return
-        val pct = (ms / dur * 100).toInt().coerceIn(0, 100)
-        if (pct != lastPct) {
-            lastPct = pct
-            runOnUiThread { pbFile.progress = pct }
+    private fun postPct(pct: Int) {
+        val p = pct.coerceIn(0, 100)
+        if (p != lastPct) {
+            lastPct = p
+            runOnUiThread { pbFile.progress = p }
         }
+    }
+
+    /** 单个任务的输出通道：日志、阶段文字、整体进度（0..1）。并行时各任务互不干扰。 */
+    private class JobUi(
+        val log: (String) -> Unit,
+        val stage: (String) -> Unit,
+        val progress: (Double) -> Unit,
+    )
+
+    /**
+     * 同步执行 ffmpeg，但走会话级回调：并行跑多个会话时，
+     * 各自的日志行和编码统计只回到自己的任务，不会像全局回调那样串台。
+     */
+    private fun runFFmpeg(
+        args: Array<String>,
+        onLogLine: ((String) -> Unit)? = null,
+        onTimeMs: ((Double) -> Unit)? = null,
+    ): FFmpegSession {
+        val latch = CountDownLatch(1)
+        val session = FFmpegKit.executeWithArgumentsAsync(
+            args,
+            { latch.countDown() },
+            { l -> onLogLine?.invoke(l.message ?: "") },
+            { st -> onTimeMs?.invoke(st.time.toDouble()) },
+        )
+        latch.await()
+        return session
     }
 
     private fun targetLufs() = -20.0 + sbTarget.progress          // 0..8 → -20..-12
@@ -285,11 +297,7 @@ class MainActivity : AppCompatActivity() {
         svLog.post { svLog.fullScroll(View.FOCUS_DOWN) }
     }
 
-    private fun stage(s: String) = runOnUiThread {
-        tvStage.text = s
-        lastPct = -1
-        pbFile.progress = 0
-    }
+    private fun stage(s: String) = runOnUiThread { tvStage.text = s }
 
     private fun setUiBusy(b: Boolean) {
         busy = b
@@ -301,6 +309,8 @@ class MainActivity : AppCompatActivity() {
         cbConcat.isEnabled = !b
         pbFile.visibility = if (b) View.VISIBLE else View.INVISIBLE
         if (b) {
+            lastPct = -1
+            pbFile.progress = 0
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -317,12 +327,13 @@ class MainActivity : AppCompatActivity() {
         setUiBusy(true)
         tvLog.text = ""
         lifecycleScope.launch(Dispatchers.IO) {
-            var ok = 0
             val t0 = System.currentTimeMillis()
             if (concat) {
+                val ui = JobUi(::log, ::stage) { x -> postPct((x * 100).toInt()) }
                 log("【拼接 ${files.size} 个视频】")
+                var ok = 0
                 try {
-                    if (concatOne(files, repair, target, strength)) ok++
+                    if (concatOne(files, repair, target, strength, ui)) ok++
                 } catch (e: Exception) {
                     log("  失败：${e.message}")
                 }
@@ -332,20 +343,52 @@ class MainActivity : AppCompatActivity() {
                 withContext(Dispatchers.Main) { setUiBusy(false) }
                 return@launch
             }
-            for ((idx, pf) in files.withIndex()) {
-                log("【${pf.name}】(${idx + 1}/${files.size})")
-                val ft0 = System.currentTimeMillis()
-                try {
-                    val done = if (repair) repairOne(pf.uri, pf.name)
-                    else processOne(pf.uri, pf.name, target, strength)
-                    if (done) {
-                        ok++
-                        log("  本视频耗时 ${elapsed(ft0)}")
+
+            // 多个视频时最多 3 路并行。进度条显示按时长加权的总进度；
+            // 日志按文件缓冲、完成后整块输出，避免并行时交错成一团
+            val durs = files.map { durationMs(it.uri).coerceAtLeast(1L) }
+            val totalDur = durs.sum().toDouble()
+            val fracs = DoubleArray(files.size)
+            fun overall() =
+                postPct((files.indices.sumOf { fracs[it] * durs[it] } / totalDur * 100).toInt())
+            val single = files.size == 1
+            if (!single) stage("并行处理中（最多 3 个同时）…")
+
+            val sem = Semaphore(3)
+            val results = files.mapIndexed { i, pf ->
+                async {
+                    sem.withPermit {
+                        val buf = StringBuilder()
+                        val ui = JobUi(
+                            log = if (single) ::log
+                            else { s -> synchronized(buf) { buf.appendLine(s); Unit } },
+                            stage = if (single) ::stage else { _ -> },
+                            progress = { x -> fracs[i] = x.coerceIn(0.0, 1.0); overall() },
+                        )
+                        if (single) log("【${pf.name}】")
+                        else log("▶ 开始 (${i + 1}/${files.size})：${pf.name}")
+                        val ft0 = System.currentTimeMillis()
+                        val okOne = try {
+                            val r = if (repair) repairOne(pf.uri, pf.name, ui)
+                            else processOne(pf.uri, pf.name, target, strength, ui)
+                            if (r) ui.log("  本视频耗时 ${elapsed(ft0)}")
+                            r
+                        } catch (e: Exception) {
+                            ui.log("  失败：${e.message}")
+                            false
+                        }
+                        fracs[i] = 1.0
+                        overall()
+                        if (!single) {
+                            log("【${pf.name}】(${i + 1}/${files.size})")
+                            log(buf.toString().trimEnd())
+                        }
+                        okOne
                     }
-                } catch (e: Exception) {
-                    log("  失败：${e.message}")
                 }
-            }
+            }.awaitAll()
+
+            val ok = results.count { it }
             log("")
             log("全部完成：成功 $ok 个，失败 ${files.size - ok} 个，总耗时 ${elapsed(t0)}。")
             if (ok > 0) log("成品在相册（或文件管理器）的 Movies/响度均衡 文件夹里。")
@@ -375,7 +418,9 @@ class MainActivity : AppCompatActivity() {
      * 在相册建条目并执行 ffmpeg 输出：主路径直接写相册（省一遍 IO），
      * 个别机型输出流不可 seek 导致 mp4 封装失败时，自动回退到"先写缓存再复制"。
      */
-    private fun encodeToGallery(outName: String, encode: (String) -> FFmpegSession): Boolean {
+    private fun encodeToGallery(
+        outName: String, logFn: (String) -> Unit, encode: (String) -> FFmpegSession,
+    ): Boolean {
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, outName)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
@@ -386,15 +431,15 @@ class MainActivity : AppCompatActivity() {
             MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values
         )
         if (outUri == null) {
-            log("  失败：无法写入相册")
+            logFn("  失败：无法写入相册")
             return false
         }
         try {
             var enc = encode(FFmpegKitConfig.getSafParameterForWrite(this, outUri))
             if (!ReturnCode.isSuccess(enc.returnCode) &&
-                enc.allLogsAsString.contains("non seekable")
+                enc.getAllLogsAsString(2000).contains("non seekable")
             ) {
-                val tmp = File(cacheDir, "out_${System.currentTimeMillis()}.mp4")
+                val tmp = File(cacheDir, "out_${System.nanoTime()}.mp4")
                 enc = encode(tmp.absolutePath)
                 if (ReturnCode.isSuccess(enc.returnCode) && tmp.exists()) {
                     contentResolver.openOutputStream(outUri)!!.use { os ->
@@ -404,15 +449,15 @@ class MainActivity : AppCompatActivity() {
                 tmp.delete()
             }
             if (!ReturnCode.isSuccess(enc.returnCode)) {
-                log("  失败：ffmpeg 处理出错：")
-                log("  " + enc.allLogsAsString.lines().takeLast(5).joinToString("\n  "))
+                logFn("  失败：ffmpeg 处理出错：")
+                logFn("  " + enc.getAllLogsAsString(2000).lines().takeLast(5).joinToString("\n  "))
                 contentResolver.delete(outUri, null, null)
                 return false
             }
             values.clear()
             values.put(MediaStore.Video.Media.IS_PENDING, 0)
             contentResolver.update(outUri, values, null, null)
-            log("  完成 → Movies/响度均衡/$outName")
+            logFn("  完成 → Movies/响度均衡/$outName")
             return true
         } catch (e: Exception) {
             contentResolver.delete(outUri, null, null)
@@ -421,12 +466,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 仅修复播放卡顿：无损重新封装成标准 mp4（分片索引重建），不动音量。 */
-    private fun repairOne(uri: Uri, name: String): Boolean {
-        currentDurationMs = durationMs(uri)
-        stage("修复封装（无损，不重编码）…")
+    private fun repairOne(uri: Uri, name: String, ui: JobUi): Boolean {
+        val dur = durationMs(uri).coerceAtLeast(1L)
+        ui.stage("修复封装（无损，不重编码）…")
         val base = name.substringBeforeLast('.')
-        return encodeToGallery("${base}_修复.mp4") { out ->
-            FFmpegKit.executeWithArguments(
+        return encodeToGallery("${base}_修复.mp4", ui.log) { out ->
+            runFFmpeg(
                 arrayOf(
                     "-hide_banner", "-y",
                     "-i", FFmpegKitConfig.getSafParameterForRead(this, uri),
@@ -434,14 +479,17 @@ class MainActivity : AppCompatActivity() {
                     "-c", "copy",
                     "-f", "mp4",
                     out,
-                )
+                ),
+                onTimeMs = { ms -> ui.progress(ms / dur) },
             )
         }
     }
 
     /** 无损拼接：把 concat 列表文件里的视频按顺序合并（-c copy），输出到 out。 */
-    private fun runConcat(listPath: String, out: String): FFmpegSession =
-        FFmpegKit.executeWithArguments(
+    private fun runConcat(
+        listPath: String, out: String, onTimeMs: ((Double) -> Unit)?,
+    ): FFmpegSession =
+        runFFmpeg(
             arrayOf(
                 "-hide_banner", "-y",
                 "-f", "concat", "-safe", "0",
@@ -451,7 +499,8 @@ class MainActivity : AppCompatActivity() {
                 "-avoid_negative_ts", "make_zero",
                 "-f", "mp4",
                 out,
-            )
+            ),
+            onTimeMs = onTimeMs,
         )
 
     /**
@@ -461,15 +510,15 @@ class MainActivity : AppCompatActivity() {
      * 所以输入必须先复制成缓存里的真实文件，不能用 saf 协议直读。
      */
     private fun concatOne(
-        files: List<PickedFile>, repair: Boolean, target: Double, strength: Double,
+        files: List<PickedFile>, repair: Boolean, target: Double, strength: Double, ui: JobUi,
     ): Boolean {
-        currentDurationMs = files.sumOf { durationMs(it.uri) }
+        val totalDur = files.sumOf { durationMs(it.uri) }.coerceAtLeast(1L).toDouble()
         val outBase = files.first().name.substringBeforeLast('.') + "_等${files.size}个拼接"
         val stamp = System.currentTimeMillis()
         val listFile = File(cacheDir, "concat_$stamp.txt")
         val tmpCopies = mutableListOf<File>()
         try {
-            stage("准备中：复制视频到缓存…")
+            ui.stage("准备中：复制视频到缓存…")
             for ((i, pf) in files.withIndex()) {
                 val f = File(cacheDir, "cat_${stamp}_$i.mp4")
                 contentResolver.openInputStream(pf.uri)!!.use { ins ->
@@ -479,24 +528,29 @@ class MainActivity : AppCompatActivity() {
             }
             listFile.writeText(tmpCopies.joinToString("") { "file '${it.absolutePath}'\n" })
 
-            stage("拼接中（无损，不重编码）…")
+            ui.stage("拼接中（无损，不重编码）…")
             if (repair) {
-                return encodeToGallery("$outBase.mp4") { out ->
-                    runConcat(listFile.absolutePath, out)
+                return encodeToGallery("$outBase.mp4", ui.log) { out ->
+                    runConcat(listFile.absolutePath, out) { ms -> ui.progress(ms / totalDur) }
                 }
             }
-            // 先无损拼到缓存，再走正常均衡流程
+            // 先无损拼到缓存（占总进度前 15%），再走正常均衡流程
             val merged = File(cacheDir, "merged_$stamp.mp4")
             try {
-                val s = runConcat(listFile.absolutePath, merged.absolutePath)
+                val s = runConcat(listFile.absolutePath, merged.absolutePath) { ms ->
+                    ui.progress(0.15 * ms / totalDur)
+                }
                 if (!ReturnCode.isSuccess(s.returnCode)) {
-                    log("  失败：拼接出错（各视频的编码/分辨率需一致）：")
-                    log("  " + s.allLogsAsString.lines().takeLast(5).joinToString("\n  "))
+                    ui.log("  失败：拼接出错（各视频的编码/分辨率需一致）：")
+                    ui.log("  " + s.getAllLogsAsString(2000).lines().takeLast(5).joinToString("\n  "))
                     return false
                 }
                 // 输入副本用完即删，给均衡阶段腾缓存空间
                 tmpCopies.forEach { it.delete() }
-                return processInput({ merged.absolutePath }, "$outBase.mp4", target, strength)
+                val sub = JobUi(ui.log, ui.stage) { x -> ui.progress(0.15 + 0.85 * x) }
+                return processInput(
+                    { merged.absolutePath }, "$outBase.mp4", totalDur.toLong(), target, strength, sub
+                )
             } finally {
                 merged.delete()
             }
@@ -507,56 +561,73 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 完整处理一个视频：扫描（含真峰值）→ 本地计算测量值 → 编码 → 存入相册。 */
-    private fun processOne(uri: Uri, name: String, target: Double, strength: Double): Boolean {
-        currentDurationMs = durationMs(uri)
-        return processInput({ FFmpegKitConfig.getSafParameterForRead(this, uri) }, name, target, strength)
-    }
-
-    /** 响度均衡主流程。input 每次调用返回一个可用的 ffmpeg 输入（saf 参数或缓存文件路径）。 */
-    private fun processInput(
-        input: () -> String, name: String, target: Double, strength: Double,
-    ): Boolean {
-        stage("第 1 步 / 共 2 步：扫描响度…")
-        scanPhase = true
-        val tScan = System.currentTimeMillis()
-        val scan = FFmpegKit.executeWithArguments(
-            arrayOf(
-                "-hide_banner", "-nostats",
-                "-i", input(),
-                "-map", "0:a:0", "-af", "ebur128=peak=true", "-f", "null", "-",
-            )
+    private fun processOne(uri: Uri, name: String, target: Double, strength: Double, ui: JobUi): Boolean =
+        processInput(
+            { FFmpegKitConfig.getSafParameterForRead(this, uri) },
+            name, durationMs(uri), target, strength, ui,
         )
-        scanPhase = false
-        if (!ReturnCode.isSuccess(scan.returnCode)) {
-            log("  失败：无法读取音频（文件可能没有声音轨）")
-            return false
+
+    /**
+     * 响度均衡主流程。input 每次调用返回一个可用的 ffmpeg 输入（saf 参数或缓存文件路径）。
+     * 进度：扫描占前 20%，编码占后 80%（与两阶段的实际耗时比例大致相符）。
+     */
+    private fun processInput(
+        input: () -> String, name: String, durMs: Long,
+        target: Double, strength: Double, ui: JobUi,
+    ): Boolean {
+        val dur = durMs.coerceAtLeast(1L).toDouble()
+        ui.stage("第 1 步 / 共 2 步：扫描响度…")
+        val tScan = System.currentTimeMillis()
+        // 扫描数据经 ametadata 写进文件再解析（日志只用来估进度，丢行也无所谓）
+        val metaFile = File(cacheDir, "scan_${System.nanoTime()}.txt")
+        val metaPath = metaFile.absolutePath.replace("\\", "/").replace(":", "\\:")
+        val pts = try {
+            val scan = runFFmpeg(
+                arrayOf(
+                    "-hide_banner", "-nostats",
+                    "-i", input(),
+                    "-map", "0:a:0",
+                    "-af", "ebur128=peak=true:metadata=1,ametadata=mode=print:file='$metaPath'",
+                    "-f", "null", "-",
+                ),
+                onLogLine = { line ->
+                    val m = tLineRe.find(line)
+                    if (m != null) ui.progress(0.2 * m.groupValues[1].toDouble() * 1000 / dur)
+                },
+            )
+            if (!ReturnCode.isSuccess(scan.returnCode)) {
+                ui.log("  失败：无法读取音频（文件可能没有声音轨）")
+                return false
+            }
+            ui.log("  扫描用时 ${elapsed(tScan)}")
+            if (!metaFile.exists()) emptyList() else Engine.parseMetadata(metaFile.readText())
+        } finally {
+            metaFile.delete()
         }
-        log("  扫描用时 ${elapsed(tScan)}")
-        val pts = Engine.parseTimeline(scan.allLogsAsString)
         if (pts.isEmpty()) {
-            log("  失败：未取得响度数据")
+            ui.log("  失败：未取得响度数据")
             return false
         }
         val segs = Engine.makeSegments(pts, target, strength)
         val knots = Engine.makeKnots(segs)
-        val cmdFile = File(cacheDir, "gain_${System.currentTimeMillis()}.cmd")
+        val cmdFile = File(cacheDir, "gain_${System.nanoTime()}.cmd")
         val vol = Engine.writeGainCmds(knots, cmdFile)
         val changed = segs.filter { abs(it.g) >= 0.5 }
-        log("  共分 ${segs.size} 段，调整 ${changed.size} 段：")
+        ui.log("  共分 ${segs.size} 段，调整 ${changed.size} 段：")
         for (sg in changed) {
-            log(String.format(java.util.Locale.US, "    %.0fs~%.0fs  %+.1f dB", sg.a, sg.b, sg.g))
+            ui.log(String.format(java.util.Locale.US, "    %.0fs~%.0fs  %+.1f dB", sg.a, sg.b, sg.g))
         }
         // 测量值直接由扫描数据计算，省掉一遍解码
         val measured = Engine.computeMeasured(pts, knots)
-        log("  分段调整后响度：${measured.i} LUFS")
+        ui.log("  分段调整后响度：${measured.i} LUFS")
 
         try {
-            stage("第 2 步 / 共 2 步：生成并保存（画面直接复制）…")
+            ui.stage("第 2 步 / 共 2 步：生成并保存（画面直接复制）…")
             val tGen = System.currentTimeMillis()
             val filter = Engine.buildFilter(target, vol, measured)
             val base = name.substringBeforeLast('.')
-            val done = encodeToGallery("${base}_均衡.mp4") { out ->
-                FFmpegKit.executeWithArguments(
+            val done = encodeToGallery("${base}_均衡.mp4", ui.log) { out ->
+                runFFmpeg(
                     arrayOf(
                         "-hide_banner", "-y",
                         "-i", input(),
@@ -566,10 +637,11 @@ class MainActivity : AppCompatActivity() {
                         "-c:a", "aac", "-b:a", "192k",
                         "-f", "mp4",
                         out,
-                    )
+                    ),
+                    onTimeMs = { ms -> ui.progress(0.2 + 0.8 * ms / dur) },
                 )
             }
-            if (done) log("  生成用时 ${elapsed(tGen)}")
+            if (done) ui.log("  生成用时 ${elapsed(tGen)}")
             return done
         } finally {
             cmdFile.delete()
