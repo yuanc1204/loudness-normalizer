@@ -58,10 +58,16 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cbRepair: CheckBox
     private lateinit var cbConcat: CheckBox
 
-    private data class PickedFile(val uri: Uri, val name: String)
+    // inConcat：该视频是否被选入拼接组（勾选的视频合并成一个，按列表顺序）
+    private class PickedFile(val uri: Uri, val name: String) {
+        var inConcat = false
+    }
 
     private val picked = mutableListOf<PickedFile>()
     private var busy = false
+
+    // 防止「全选拼接」总开关与每行勾选框互相触发监听造成的循环
+    private var syncingConcat = false
 
     @Volatile
     private var lastPct = -1
@@ -112,7 +118,10 @@ class MainActivity : AppCompatActivity() {
             sbStrength.isEnabled = !checked && !busy
             updateStartText()
         }
-        cbConcat.setOnCheckedChangeListener { _, _ ->
+        // 底部「拼接」是总开关：勾选=全选所有视频进拼接组，取消=全不选
+        cbConcat.setOnCheckedChangeListener { _, checked ->
+            if (syncingConcat) return@setOnCheckedChangeListener
+            picked.forEach { it.inConcat = checked }
             updateStartText()
             refreshFileList()
         }
@@ -190,11 +199,15 @@ class MainActivity : AppCompatActivity() {
     private fun targetLufs() = -20.0 + sbTarget.progress          // 0..8 → -20..-12
     private fun strength() = (50 + sbStrength.progress) / 100.0   // 0..50 → 0.5..1.0
 
+    /** 拼接组有效需 2 个以上视频；不足按各自单独处理。 */
+    private fun willConcat() = picked.count { it.inConcat } >= 2
+
     private fun updateStartText() {
+        val repair = cbRepair.isChecked
         btnStart.text = when {
-            cbConcat.isChecked && cbRepair.isChecked -> "开始拼接（不调音量）"
-            cbConcat.isChecked -> "拼接并均衡"
-            cbRepair.isChecked -> "开始修复"
+            willConcat() && repair -> "拼接并修复"
+            willConcat() -> "拼接并均衡"
+            repair -> "开始修复"
             else -> "开始处理"
         }
     }
@@ -205,10 +218,15 @@ class MainActivity : AppCompatActivity() {
         override fun onStopTrackingTouch(sb: SeekBar?) {}
     }
 
-    private class FileVH(row: LinearLayout, val handle: TextView, val name: TextView, val del: TextView) :
-        RecyclerView.ViewHolder(row)
+    private class FileVH(
+        row: LinearLayout,
+        val handle: TextView,
+        val name: TextView,
+        val cbCat: CheckBox,
+        val del: TextView,
+    ) : RecyclerView.ViewHolder(row)
 
-    /** 已选文件列表：按住 ≡ 拖动排序（拼接顺序即列表顺序），✕ 删除。 */
+    /** 已选文件列表：按住 ≡ 拖动排序（拼接顺序即列表顺序），勾「拼接」入组，✕ 删除。 */
     private val fileAdapter: RecyclerView.Adapter<FileVH> = object : RecyclerView.Adapter<FileVH>() {
         override fun getItemCount() = picked.size
 
@@ -226,6 +244,10 @@ class MainActivity : AppCompatActivity() {
                 ellipsize = TextUtils.TruncateAt.MIDDLE
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             }
+            val cbCat = CheckBox(parent.context).apply {
+                text = "拼接"
+                textSize = 12f
+            }
             val del = icon("✕", 16f)
             val row = LinearLayout(parent.context).apply {
                 orientation = LinearLayout.HORIZONTAL
@@ -235,13 +257,15 @@ class MainActivity : AppCompatActivity() {
                 )
                 addView(handle)
                 addView(name)
+                addView(cbCat)
                 addView(del)
             }
-            return FileVH(row, handle, name, del)
+            return FileVH(row, handle, name, cbCat, del)
         }
 
         override fun onBindViewHolder(h: FileVH, position: Int) {
-            h.name.text = picked[position].name
+            val pf = picked[position]
+            h.name.text = pf.name
             h.handle.visibility = if (picked.size > 1) View.VISIBLE else View.GONE
             h.handle.setOnTouchListener { v, ev ->
                 if (ev.actionMasked == MotionEvent.ACTION_DOWN && !busy) {
@@ -250,12 +274,33 @@ class MainActivity : AppCompatActivity() {
                 }
                 false
             }
+            // 拼接勾选框：单个视频时无意义，隐藏
+            h.cbCat.visibility = if (picked.size > 1) View.VISIBLE else View.GONE
+            h.cbCat.isEnabled = !busy
+            h.cbCat.setOnCheckedChangeListener(null)
+            h.cbCat.isChecked = pf.inConcat
+            h.cbCat.setOnCheckedChangeListener { _, checked ->
+                val p = picked.getOrNull(h.bindingAdapterPosition) ?: return@setOnCheckedChangeListener
+                p.inConcat = checked
+                syncMasterConcat()
+                updateStartText()
+            }
             h.del.setOnClickListener {
                 val pos = h.bindingAdapterPosition
                 if (busy || pos == RecyclerView.NO_POSITION) return@setOnClickListener
                 picked.removeAt(pos)
                 refreshFileList()
             }
+        }
+    }
+
+    /** 每行勾选变化后，把底部总开关同步为「是否全部已选」，且不反过来触发它的监听。 */
+    private fun syncMasterConcat() {
+        val all = picked.isNotEmpty() && picked.all { it.inConcat }
+        if (cbConcat.isChecked != all) {
+            syncingConcat = true
+            cbConcat.isChecked = all
+            syncingConcat = false
         }
     }
 
@@ -290,6 +335,9 @@ class MainActivity : AppCompatActivity() {
         }
         tvSelected.text = if (picked.isEmpty()) "未选择视频" else "已选择 ${picked.size} 个视频"
         btnStart.isEnabled = picked.isNotEmpty() && !busy
+        cbConcat.isEnabled = picked.size > 1 && !busy
+        syncMasterConcat()
+        updateStartText()
     }
 
     private fun log(s: String) = runOnUiThread {
@@ -306,7 +354,8 @@ class MainActivity : AppCompatActivity() {
         sbTarget.isEnabled = !b && !cbRepair.isChecked
         sbStrength.isEnabled = !b && !cbRepair.isChecked
         cbRepair.isEnabled = !b
-        cbConcat.isEnabled = !b
+        cbConcat.isEnabled = !b && picked.size > 1
+        fileAdapter.notifyDataSetChanged()   // 重新绑定，让每行「拼接」勾选框随忙碌禁用
         pbFile.visibility = if (b) View.VISIBLE else View.INVISIBLE
         if (b) {
             lastPct = -1
@@ -318,44 +367,50 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /** 一个并行任务：一段拼接组或一个单独视频。weightMs 用于进度按时长加权。 */
+    private class Job(val title: String, val weightMs: Long, val run: (JobUi) -> Boolean)
+
     private fun startProcessing() {
         val target = targetLufs()
         val strength = strength()
         val repair = cbRepair.isChecked
-        val concat = cbConcat.isChecked && picked.size >= 2
         val files = picked.toList()
         setUiBusy(true)
         tvLog.text = ""
+
+        // 勾了「拼接」的视频（≥2 个才成组）合并为一个任务，其余各自单独一个任务；
+        // 拼接组和单独视频一起进并行队列。全局「仅修复」决定整批是均衡还是仅修复。
+        val doConcat = files.count { it.inConcat } >= 2
+        val concatFiles = if (doConcat) files.filter { it.inConcat } else emptyList()
+        val singleFiles = if (doConcat) files.filter { !it.inConcat } else files
+
+        val jobs = ArrayList<Job>()
+        if (doConcat) {
+            val w = concatFiles.sumOf { durationMs(it.uri).coerceAtLeast(1L) }
+            jobs.add(Job("拼接 ${concatFiles.size} 个视频", w) { ui ->
+                concatOne(concatFiles, repair, target, strength, ui)
+            })
+        }
+        for (pf in singleFiles) {
+            val w = durationMs(pf.uri).coerceAtLeast(1L)
+            jobs.add(Job(pf.name, w) { ui ->
+                if (repair) repairOne(pf.uri, pf.name, ui)
+                else processOne(pf.uri, pf.name, target, strength, ui)
+            })
+        }
+
         lifecycleScope.launch(Dispatchers.IO) {
             val t0 = System.currentTimeMillis()
-            if (concat) {
-                val ui = JobUi(::log, ::stage) { x -> postPct((x * 100).toInt()) }
-                log("【拼接 ${files.size} 个视频】")
-                var ok = 0
-                try {
-                    if (concatOne(files, repair, target, strength, ui)) ok++
-                } catch (e: Exception) {
-                    log("  失败：${e.message}")
-                }
-                log("")
-                log(if (ok > 0) "拼接完成，总耗时 ${elapsed(t0)}。" else "拼接失败。")
-                if (ok > 0) log("成品在相册（或文件管理器）的 Movies/响度均衡 文件夹里。")
-                withContext(Dispatchers.Main) { setUiBusy(false) }
-                return@launch
-            }
-
-            // 多个视频时最多 3 路并行。进度条显示按时长加权的总进度；
-            // 日志按文件缓冲、完成后整块输出，避免并行时交错成一团
-            val durs = files.map { durationMs(it.uri).coerceAtLeast(1L) }
-            val totalDur = durs.sum().toDouble()
-            val fracs = DoubleArray(files.size)
+            // 进度条显示按时长加权的总进度；日志按任务缓冲、完成后整块输出，避免交错
+            val totalDur = jobs.sumOf { it.weightMs }.coerceAtLeast(1L).toDouble()
+            val fracs = DoubleArray(jobs.size)
             fun overall() =
-                postPct((files.indices.sumOf { fracs[it] * durs[it] } / totalDur * 100).toInt())
-            val single = files.size == 1
+                postPct((jobs.indices.sumOf { fracs[it] * jobs[it].weightMs } / totalDur * 100).toInt())
+            val single = jobs.size == 1
             if (!single) stage("并行处理中（最多 3 个同时）…")
 
             val sem = Semaphore(3)
-            val results = files.mapIndexed { i, pf ->
+            val results = jobs.mapIndexed { i, job ->
                 async {
                     sem.withPermit {
                         val buf = StringBuilder()
@@ -365,13 +420,12 @@ class MainActivity : AppCompatActivity() {
                             stage = if (single) ::stage else { _ -> },
                             progress = { x -> fracs[i] = x.coerceIn(0.0, 1.0); overall() },
                         )
-                        if (single) log("【${pf.name}】")
-                        else log("▶ 开始 (${i + 1}/${files.size})：${pf.name}")
+                        if (single) log("【${job.title}】")
+                        else log("▶ 开始 (${i + 1}/${jobs.size})：${job.title}")
                         val ft0 = System.currentTimeMillis()
                         val okOne = try {
-                            val r = if (repair) repairOne(pf.uri, pf.name, ui)
-                            else processOne(pf.uri, pf.name, target, strength, ui)
-                            if (r) ui.log("  本视频耗时 ${elapsed(ft0)}")
+                            val r = job.run(ui)
+                            if (r) ui.log("  本任务耗时 ${elapsed(ft0)}")
                             r
                         } catch (e: Exception) {
                             ui.log("  失败：${e.message}")
@@ -380,7 +434,7 @@ class MainActivity : AppCompatActivity() {
                         fracs[i] = 1.0
                         overall()
                         if (!single) {
-                            log("【${pf.name}】(${i + 1}/${files.size})")
+                            log("【${job.title}】(${i + 1}/${jobs.size})")
                             log(buf.toString().trimEnd())
                         }
                         okOne
@@ -390,7 +444,7 @@ class MainActivity : AppCompatActivity() {
 
             val ok = results.count { it }
             log("")
-            log("全部完成：成功 $ok 个，失败 ${files.size - ok} 个，总耗时 ${elapsed(t0)}。")
+            log("全部完成：成功 $ok 个，失败 ${jobs.size - ok} 个，总耗时 ${elapsed(t0)}。")
             if (ok > 0) log("成品在相册（或文件管理器）的 Movies/响度均衡 文件夹里。")
             withContext(Dispatchers.Main) { setUiBusy(false) }
         }

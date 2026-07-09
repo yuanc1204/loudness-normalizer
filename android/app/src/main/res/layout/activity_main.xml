@@ -80,7 +80,7 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="4dp"
-        android:text="拼接：按列表顺序合并成一个视频（拖 ≡ 排序）"
+        android:text="全部拼接成一个视频（也可在每行单独勾选，拖 ≡ 排序）"
         android:textSize="13sp" />
 
     <CheckBox
