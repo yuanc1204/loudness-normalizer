@@ -619,12 +619,16 @@ class MainActivity : AppCompatActivity() {
         }
         // 测量值直接由扫描数据计算，省掉一遍解码
         val measured = Engine.computeMeasured(pts, knots)
-        ui.log("  分段调整后响度：${measured.i} LUFS")
 
+        // 在生成链末尾挂个 ebur128 量成品响度，随生成一起算（几乎零成本），
+        // 读它写出的最后一个 I 值——就是这个视频最终的实测响度
+        val finalMeta = File(cacheDir, "final_${System.nanoTime()}.txt")
+        val finalPath = finalMeta.absolutePath.replace("\\", "/").replace(":", "\\:")
         try {
             ui.stage("第 2 步 / 共 2 步：生成并保存（画面直接复制）…")
             val tGen = System.currentTimeMillis()
-            val filter = Engine.buildFilter(target, vol, measured)
+            val filter = Engine.buildFilter(target, vol, measured) +
+                ",ebur128=metadata=1,ametadata=mode=print:file='$finalPath'"
             val base = name.substringBeforeLast('.')
             val done = encodeToGallery("${base}_均衡.mp4", ui.log) { out ->
                 runFFmpeg(
@@ -641,10 +645,29 @@ class MainActivity : AppCompatActivity() {
                     onTimeMs = { ms -> ui.progress(0.2 + 0.8 * ms / dur) },
                 )
             }
-            if (done) ui.log("  生成用时 ${elapsed(tGen)}")
+            if (done) {
+                readFinalLoudness(finalMeta)?.let {
+                    ui.log(String.format(java.util.Locale.US, "  均衡后最终响度：%.2f LUFS", it))
+                }
+                ui.log("  生成用时 ${elapsed(tGen)}")
+            }
             return done
         } finally {
             cmdFile.delete()
+            finalMeta.delete()
         }
+    }
+
+    /** 从生成链末尾 ebur128 写出的 metadata 文件里取最后一个积分响度 I。 */
+    private fun readFinalLoudness(f: File): Double? {
+        if (!f.exists()) return null
+        var last: Double? = null
+        f.forEachLine { line ->
+            if (line.startsWith("lavfi.r128.I=")) {
+                line.substring(13).trim().toDoubleOrNull()
+                    ?.let { if (it.isFinite() && it > -70) last = it }
+            }
+        }
+        return last
     }
 }
