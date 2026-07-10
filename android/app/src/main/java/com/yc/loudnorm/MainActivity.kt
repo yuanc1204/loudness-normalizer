@@ -2,6 +2,7 @@ package com.yc.loudnorm
 
 import android.content.ContentValues
 import android.content.Intent
+import android.graphics.Bitmap
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
@@ -17,6 +18,7 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.ScrollView
@@ -63,6 +65,8 @@ class MainActivity : AppCompatActivity() {
     // inConcat：该视频是否被选入拼接组（勾选的视频合并成一个，按列表顺序）
     private class PickedFile(val uri: Uri, val name: String) {
         var inConcat = false
+        var thumbnail: Bitmap? = null
+        var thumbnailRequested = false
     }
 
     private val picked = mutableListOf<PickedFile>()
@@ -223,6 +227,7 @@ class MainActivity : AppCompatActivity() {
     private class FileVH(
         row: LinearLayout,
         val handle: TextView,
+        val preview: ImageView,
         val name: TextView,
         val cbCat: CheckBox,
         val del: TextView,
@@ -240,6 +245,15 @@ class MainActivity : AppCompatActivity() {
                 setPadding((10 * dp).toInt(), (6 * dp).toInt(), (10 * dp).toInt(), (6 * dp).toInt())
             }
             val handle = icon("≡", 18f)
+            val preview = ImageView(parent.context).apply {
+                layoutParams = LinearLayout.LayoutParams((56 * dp).toInt(), (42 * dp).toInt()).apply {
+                    marginEnd = (8 * dp).toInt()
+                }
+                scaleType = ImageView.ScaleType.CENTER_CROP
+                setBackgroundColor(0xFFE0E0E0.toInt())
+                setImageResource(android.R.drawable.ic_media_play)
+                contentDescription = "视频预览图"
+            }
             val name = TextView(parent.context).apply {
                 textSize = 13f
                 maxLines = 1
@@ -258,16 +272,24 @@ class MainActivity : AppCompatActivity() {
                     RecyclerView.LayoutParams.MATCH_PARENT, RecyclerView.LayoutParams.WRAP_CONTENT
                 )
                 addView(handle)
+                addView(preview)
                 addView(name)
                 addView(cbCat)
                 addView(del)
             }
-            return FileVH(row, handle, name, cbCat, del)
+            return FileVH(row, handle, preview, name, cbCat, del)
         }
 
         override fun onBindViewHolder(h: FileVH, position: Int) {
             val pf = picked[position]
             h.name.text = pf.name
+            val thumbnail = pf.thumbnail
+            if (thumbnail != null) {
+                h.preview.setImageBitmap(thumbnail)
+            } else {
+                h.preview.setImageResource(android.R.drawable.ic_media_play)
+                requestThumbnail(pf)
+            }
             h.handle.visibility = if (picked.size > 1) View.VISIBLE else View.GONE
             h.handle.setOnTouchListener { v, ev ->
                 if (ev.actionMasked == MotionEvent.ACTION_DOWN && !busy) {
@@ -292,6 +314,35 @@ class MainActivity : AppCompatActivity() {
                 if (busy || pos == RecyclerView.NO_POSITION) return@setOnClickListener
                 picked.removeAt(pos)
                 refreshFileList()
+            }
+        }
+    }
+
+    /** 在后台读取视频画面并生成小尺寸预览，避免选择多个视频时阻塞界面。 */
+    private fun requestThumbnail(pf: PickedFile) {
+        if (pf.thumbnailRequested) return
+        pf.thumbnailRequested = true
+        lifecycleScope.launch {
+            val bitmap = withContext(Dispatchers.IO) {
+                val retriever = MediaMetadataRetriever()
+                try {
+                    retriever.setDataSource(this@MainActivity, pf.uri)
+                    retriever.getScaledFrameAtTime(
+                        0,
+                        MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                        160,
+                        120,
+                    )
+                } catch (_: Exception) {
+                    null
+                } finally {
+                    retriever.release()
+                }
+            }
+            if (bitmap != null) {
+                pf.thumbnail = bitmap
+                val position = picked.indexOf(pf)
+                if (position >= 0) fileAdapter.notifyItemChanged(position)
             }
         }
     }
