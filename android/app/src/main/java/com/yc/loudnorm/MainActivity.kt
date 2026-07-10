@@ -2,6 +2,8 @@ package com.yc.loudnorm
 
 import android.content.ContentValues
 import android.content.Intent
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Bundle
@@ -557,9 +559,66 @@ class MainActivity : AppCompatActivity() {
             onTimeMs = onTimeMs,
         )
 
+    /** 视频关键参数，用于判断能否无损拼接。 */
+    private class VidInfo(
+        val mime: String, val w: Int, val h: Int, val rot: Int, val csd: ByteArray?,
+        val aMime: String?, val aRate: Int, val aCh: Int,
+    ) {
+        fun desc(): String {
+            val v = "${mime.removePrefix("video/")} ${w}x${h}" + (if (rot != 0) " 旋转${rot}°" else "")
+            val a = aMime?.let { "，音频 ${it.removePrefix("audio/")} ${aRate}Hz ${aCh}声道" } ?: "，无音轨"
+            return v + a
+        }
+    }
+
+    private fun probeVideo(uri: Uri): VidInfo? = try {
+        contentResolver.openFileDescriptor(uri, "r")!!.use { pfd ->
+            val ex = MediaExtractor()
+            try {
+                ex.setDataSource(pfd.fileDescriptor)
+                var mime = ""; var w = 0; var h = 0; var rot = 0
+                var csd: ByteArray? = null
+                var aMime: String? = null; var aRate = 0; var aCh = 0
+                for (i in 0 until ex.trackCount) {
+                    val f = ex.getTrackFormat(i)
+                    val m = f.getString(MediaFormat.KEY_MIME) ?: continue
+                    if (m.startsWith("video/") && mime.isEmpty()) {
+                        mime = m
+                        w = f.getInteger(MediaFormat.KEY_WIDTH)
+                        h = f.getInteger(MediaFormat.KEY_HEIGHT)
+                        rot = try { f.getInteger(MediaFormat.KEY_ROTATION) } catch (e: Exception) { 0 }
+                        csd = try {
+                            f.getByteBuffer("csd-0")?.let { b ->
+                                ByteArray(b.remaining()).also { b.get(it) }
+                            }
+                        } catch (e: Exception) { null }
+                    } else if (m.startsWith("audio/") && aMime == null) {
+                        aMime = m
+                        aRate = try { f.getInteger(MediaFormat.KEY_SAMPLE_RATE) } catch (e: Exception) { 0 }
+                        aCh = try { f.getInteger(MediaFormat.KEY_CHANNEL_COUNT) } catch (e: Exception) { 0 }
+                    }
+                }
+                if (mime.isEmpty()) null else VidInfo(mime, w, h, rot, csd, aMime, aRate, aCh)
+            } finally {
+                ex.release()
+            }
+        }
+    } catch (e: Exception) {
+        null
+    }
+
+    /** 无损拼接要求：编码、分辨率、旋转、编码头（SPS/PPS）、音频参数全部一致。 */
+    private fun sameParams(a: VidInfo, b: VidInfo): Boolean =
+        a.mime == b.mime && a.w == b.w && a.h == b.h && a.rot == b.rot &&
+            ((a.csd == null && b.csd == null) ||
+                (a.csd != null && b.csd != null && a.csd.contentEquals(b.csd))) &&
+            a.aMime == b.aMime && a.aRate == b.aRate && a.aCh == b.aCh
+
     /**
-     * 拼接所有视频。repair=true 时只无损拼接（拼接本身就是重新封装，顺带修复卡顿）；
+     * 拼接所有视频（仅无损 -c copy）。repair=true 时只拼接不调音量；
      * 否则拼到缓存后再对合并结果做响度均衡。
+     * 各视频编码/分辨率/编码头/音频参数必须一致，否则 -c copy 会产出时长错乱、
+     * 后段无法播放的坏文件——故先探测参数，不一致直接报错跳过，不生成坏文件。
      * 注意：concat 分段切换时关闭 saf 输入会原生崩溃（saf_close），
      * 所以输入必须先复制成缓存里的真实文件，不能用 saf 协议直读。
      */
@@ -572,6 +631,22 @@ class MainActivity : AppCompatActivity() {
         val listFile = File(cacheDir, "concat_$stamp.txt")
         val tmpCopies = mutableListOf<File>()
         try {
+            // 先探测各视频参数：不一致就直接报错，避免生成坏文件、也不浪费复制时间
+            val infos = files.map { probeVideo(it.uri) }
+            val ref = infos.firstOrNull { it != null }
+            if (ref == null) {
+                ui.log("  失败：无法识别视频编码参数")
+                return false
+            }
+            if (infos.any { it == null || !sameParams(ref, it) }) {
+                ui.log("  失败：这些视频的编码参数不一致，无法无损拼接。")
+                ui.log("  （拼接要求编码、分辨率、旋转、音频参数完全相同，一般同一来源的视频才满足）")
+                for ((i, pf) in files.withIndex()) {
+                    ui.log("    ${pf.name}：${infos[i]?.desc() ?: "无法识别"}")
+                }
+                return false
+            }
+
             ui.stage("准备中：复制视频到缓存…")
             for ((i, pf) in files.withIndex()) {
                 val f = File(cacheDir, "cat_${stamp}_$i.mp4")
@@ -595,8 +670,8 @@ class MainActivity : AppCompatActivity() {
                     ui.progress(0.15 * ms / totalDur)
                 }
                 if (!ReturnCode.isSuccess(s.returnCode)) {
-                    ui.log("  失败：拼接出错（各视频的编码/分辨率需一致）：")
-                    ui.log("  " + s.getAllLogsAsString(2000).lines().takeLast(5).joinToString("\n  "))
+                    ui.log("  失败：拼接出错：")
+                    ui.log("  " + s.getAllLogsAsString(2000).lines().takeLast(6).joinToString("\n  "))
                     return false
                 }
                 // 输入副本用完即删，给均衡阶段腾缓存空间
