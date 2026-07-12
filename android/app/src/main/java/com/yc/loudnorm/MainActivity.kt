@@ -1,13 +1,18 @@
 package com.yc.loudnorm
 
+import android.Manifest
+import android.app.AlertDialog
 import android.content.ContentValues
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.StatFs
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.text.TextUtils
@@ -26,6 +31,7 @@ import android.widget.SeekBar
 import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.recyclerview.widget.ItemTouchHelper
 import androidx.recyclerview.widget.LinearLayoutManager
@@ -35,8 +41,11 @@ import com.antonkarpenko.ffmpegkit.FFmpegKitConfig
 import com.antonkarpenko.ffmpegkit.FFmpegSession
 import com.antonkarpenko.ffmpegkit.ReturnCode
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -71,6 +80,10 @@ class MainActivity : AppCompatActivity() {
 
     private val picked = mutableListOf<PickedFile>()
     private var busy = false
+    private val processingScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    @Volatile
+    private var notificationStage = "准备处理…"
 
     // 防止「全选拼接」总开关与每行勾选框互相触发监听造成的循环
     private var syncingConcat = false
@@ -90,6 +103,9 @@ class MainActivity : AppCompatActivity() {
             }
             refreshFileList()
         }
+
+    private val requestNotificationPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -135,6 +151,15 @@ class MainActivity : AppCompatActivity() {
         btnPick.setOnClickListener { pickVideos.launch(arrayOf("video/*")) }
         btnStart.setOnClickListener { startProcessing() }
 
+        if (ProcessingService.isRunning) {
+            setUiBusy(true)
+            tvStage.text = "正在后台处理，请在通知栏查看进度"
+            lifecycleScope.launch {
+                while (ProcessingService.isRunning) delay(500)
+                if (busy) setUiBusy(false)
+            }
+        }
+
         handleShareIntent(intent)
     }
 
@@ -172,6 +197,7 @@ class MainActivity : AppCompatActivity() {
         if (p != lastPct) {
             lastPct = p
             runOnUiThread { pbFile.progress = p }
+            ProcessingService.update(p, notificationStage)
         }
     }
 
@@ -398,7 +424,11 @@ class MainActivity : AppCompatActivity() {
         svLog.post { svLog.fullScroll(View.FOCUS_DOWN) }
     }
 
-    private fun stage(s: String) = runOnUiThread { tvStage.text = s }
+    private fun stage(s: String) {
+        notificationStage = s
+        ProcessingService.update(lastPct.coerceAtLeast(0), s)
+        runOnUiThread { tvStage.text = s }
+    }
 
     private fun setUiBusy(b: Boolean) {
         busy = b
@@ -424,12 +454,34 @@ class MainActivity : AppCompatActivity() {
     private class Job(val title: String, val weightMs: Long, val run: (JobUi) -> Boolean)
 
     private fun startProcessing() {
+        val required = requiredFreeBytes()
+        val available = StatFs(cacheDir.absolutePath).availableBytes
+        if (required > 0 && available < required) {
+            AlertDialog.Builder(this)
+                .setTitle("存储空间不足")
+                .setMessage(
+                    "本次处理预计至少需要 ${formatBytes(required)} 可用空间，" +
+                        "当前约有 ${formatBytes(available)}。请清理空间后再试。"
+                )
+                .setPositiveButton("知道了", null)
+                .show()
+            return
+        }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
         val target = targetLufs()
         val strength = strength()
         val repair = cbRepair.isChecked
         val files = picked.toList()
         setUiBusy(true)
         tvLog.text = ""
+        notificationStage = "准备处理…"
+        ProcessingService.start(this)
 
         // 勾了「拼接」的视频（≥2 个才成组）合并为一个任务，其余各自单独一个任务；
         // 拼接组和单独视频一起进并行队列。全局「仅修复」决定整批是均衡还是仅修复。
@@ -452,7 +504,7 @@ class MainActivity : AppCompatActivity() {
             })
         }
 
-        lifecycleScope.launch(Dispatchers.IO) {
+        processingScope.launch {
             val t0 = System.currentTimeMillis()
             // 进度条显示按时长加权的总进度；日志按任务缓冲、完成后整块输出，避免交错
             val totalDur = jobs.sumOf { it.weightMs }.coerceAtLeast(1L).toDouble()
@@ -499,8 +551,37 @@ class MainActivity : AppCompatActivity() {
             log("")
             log("全部完成：成功 $ok 个，失败 ${jobs.size - ok} 个，总耗时 ${elapsed(t0)}。")
             if (ok > 0) log("成品在相册（或文件管理器）的 Movies/响度均衡 文件夹里。")
+            ProcessingService.finish(ok > 0, "成功 $ok 个，失败 ${jobs.size - ok} 个")
             withContext(Dispatchers.Main) { setUiBusy(false) }
         }
+    }
+
+    /** 只查询文件大小和磁盘余量，不读取视频内容，通常可在瞬间完成。 */
+    private fun requiredFreeBytes(): Long {
+        fun sizeOf(pf: PickedFile): Long = try {
+            contentResolver.query(
+                pf.uri, arrayOf(OpenableColumns.SIZE), null, null, null
+            )?.use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else 0L } ?: 0L
+        } catch (_: Exception) {
+            0L
+        }
+
+        val sizes = picked.associateWith(::sizeOf)
+        val concatBytes = if (willConcat()) {
+            picked.filter { it.inConcat }.sumOf { sizes[it] ?: 0L }
+        } else 0L
+        val singleBytes = picked.filter { !willConcat() || !it.inConcat }.sumOf { sizes[it] ?: 0L }
+        if (concatBytes + singleBytes == 0L) return 0L
+
+        // 普通输出约等于输入；拼接在峰值时还需容纳输入副本和合并文件。
+        val estimatedPeak = singleBytes + concatBytes * 2
+        return (estimatedPeak * 1.15).toLong() + 100L * 1024 * 1024
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        val gb = bytes / (1024.0 * 1024 * 1024)
+        return if (gb >= 1) String.format("%.1f GB", gb)
+        else String.format("%.0f MB", bytes / (1024.0 * 1024))
     }
 
     private fun elapsed(since: Long): String {
