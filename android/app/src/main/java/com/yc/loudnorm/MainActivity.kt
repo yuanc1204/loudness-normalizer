@@ -406,10 +406,11 @@ class MainActivity : AppCompatActivity() {
     @Suppress("NotifyDataSetChanged")
     private fun refreshFileList() {
         fileAdapter.notifyDataSetChanged()
-        // 超过 5 个时列表内滚动，避免挤掉下面的日志区
+        rvFiles.visibility = if (busy || picked.isEmpty()) View.GONE else View.VISIBLE
+        // 缩略图列表最多显示三行，更多视频在列表内滚动，给下面的日志区留空间。
         val dp = resources.displayMetrics.density
         rvFiles.layoutParams = rvFiles.layoutParams.apply {
-            height = if (picked.size > 5) (170 * dp).toInt()
+            height = if (picked.size > 3) (132 * dp).toInt()
             else ViewGroup.LayoutParams.WRAP_CONTENT
         }
         tvSelected.text = if (picked.isEmpty()) "未选择视频" else "已选择 ${picked.size} 个视频"
@@ -438,6 +439,7 @@ class MainActivity : AppCompatActivity() {
         sbStrength.isEnabled = !b && !cbRepair.isChecked
         cbRepair.isEnabled = !b
         cbConcat.isEnabled = !b && picked.size > 1
+        rvFiles.visibility = if (b || picked.isEmpty()) View.GONE else View.VISIBLE
         fileAdapter.notifyDataSetChanged()   // 重新绑定，让每行「拼接」勾选框随忙碌禁用
         pbFile.visibility = if (b) View.VISIBLE else View.INVISIBLE
         if (b) {
@@ -509,6 +511,8 @@ class MainActivity : AppCompatActivity() {
             // 进度条显示按时长加权的总进度；日志按任务缓冲、完成后整块输出，避免交错
             val totalDur = jobs.sumOf { it.weightMs }.coerceAtLeast(1L).toDouble()
             val fracs = DoubleArray(jobs.size)
+            val resultLogLock = Any()
+            var resultBlocks = 0
             fun overall() =
                 postPct((jobs.indices.sumOf { fracs[it] * jobs[it].weightMs } / totalDur * 100).toInt())
             val single = jobs.size == 1
@@ -526,11 +530,10 @@ class MainActivity : AppCompatActivity() {
                             progress = { x -> fracs[i] = x.coerceIn(0.0, 1.0); overall() },
                         )
                         if (single) log("【${job.title}】")
-                        else log("▶ 开始 (${i + 1}/${jobs.size})：${job.title}")
                         val ft0 = System.currentTimeMillis()
                         val okOne = try {
                             val r = job.run(ui)
-                            if (r) ui.log("  本任务耗时 ${elapsed(ft0)}")
+                            if (r) ui.log("  耗时 ${elapsed(ft0)}")
                             r
                         } catch (e: Exception) {
                             ui.log("  失败：${e.message}")
@@ -539,8 +542,12 @@ class MainActivity : AppCompatActivity() {
                         fracs[i] = 1.0
                         overall()
                         if (!single) {
-                            log("【${job.title}】(${i + 1}/${jobs.size})")
-                            log(buf.toString().trimEnd())
+                            synchronized(resultLogLock) {
+                                if (resultBlocks > 0) log("")
+                                resultBlocks++
+                                log("【${job.title}】(${i + 1}/${jobs.size})")
+                                log(buf.toString().trimEnd())
+                            }
                         }
                         okOne
                     }
@@ -552,7 +559,12 @@ class MainActivity : AppCompatActivity() {
             log("全部完成：成功 $ok 个，失败 ${jobs.size - ok} 个，总耗时 ${elapsed(t0)}。")
             if (ok > 0) log("成品在相册（或文件管理器）的 Movies/响度均衡 文件夹里。")
             ProcessingService.finish(ok > 0, "成功 $ok 个，失败 ${jobs.size - ok} 个")
-            withContext(Dispatchers.Main) { setUiBusy(false) }
+            withContext(Dispatchers.Main) {
+                picked.forEach { it.thumbnail?.recycle() }
+                picked.clear()
+                setUiBusy(false)
+                refreshFileList()
+            }
         }
     }
 
@@ -838,7 +850,6 @@ class MainActivity : AppCompatActivity() {
     ): Boolean {
         val dur = durMs.coerceAtLeast(1L).toDouble()
         ui.stage("第 1 步 / 共 2 步：扫描响度…")
-        val tScan = System.currentTimeMillis()
         // 扫描数据经 ametadata 写进文件再解析（日志只用来估进度，丢行也无所谓）
         val metaFile = File(cacheDir, "scan_${System.nanoTime()}.txt")
         val metaPath = metaFile.absolutePath.replace("\\", "/").replace(":", "\\:")
@@ -860,7 +871,6 @@ class MainActivity : AppCompatActivity() {
                 ui.log("  失败：无法读取音频（文件可能没有声音轨）")
                 return false
             }
-            ui.log("  扫描用时 ${elapsed(tScan)}")
             if (!metaFile.exists()) emptyList() else Engine.parseMetadata(metaFile.readText())
         } finally {
             metaFile.delete()
