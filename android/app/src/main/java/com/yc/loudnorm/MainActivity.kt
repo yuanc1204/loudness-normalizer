@@ -41,8 +41,6 @@ import com.antonkarpenko.ffmpegkit.FFmpegKitConfig
 import com.antonkarpenko.ffmpegkit.FFmpegSession
 import com.antonkarpenko.ffmpegkit.ReturnCode
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
@@ -80,7 +78,6 @@ class MainActivity : AppCompatActivity() {
 
     private val picked = mutableListOf<PickedFile>()
     private var busy = false
-    private val processingScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     @Volatile
     private var notificationStage = "准备处理…"
@@ -194,7 +191,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun postPct(pct: Int) {
         val p = pct.coerceIn(0, 100)
-        if (p != lastPct) {
+        if (p > lastPct) {
             lastPct = p
             runOnUiThread { pbFile.progress = p }
             ProcessingService.update(p, notificationStage)
@@ -483,7 +480,6 @@ class MainActivity : AppCompatActivity() {
         setUiBusy(true)
         tvLog.text = ""
         notificationStage = "准备处理…"
-        ProcessingService.start(this)
 
         // 勾了「拼接」的视频（≥2 个才成组）合并为一个任务，其余各自单独一个任务；
         // 拼接组和单独视频一起进并行队列。全局「仅修复」决定整批是均衡还是仅修复。
@@ -506,15 +502,27 @@ class MainActivity : AppCompatActivity() {
             })
         }
 
-        processingScope.launch {
+        ProcessingService.start(this) {
+            try {
             val t0 = System.currentTimeMillis()
             // 进度条显示按时长加权的总进度；日志按任务缓冲、完成后整块输出，避免交错
             val totalDur = jobs.sumOf { it.weightMs }.coerceAtLeast(1L).toDouble()
             val fracs = DoubleArray(jobs.size)
+            val progressLock = Any()
             val resultLogLock = Any()
             var resultBlocks = 0
-            fun overall() =
-                postPct((jobs.indices.sumOf { fracs[it] * jobs[it].weightMs } / totalDur * 100).toInt())
+            var highestOverall = 0
+            fun updateOverall(index: Int, fraction: Double) {
+                val pct = synchronized(progressLock) {
+                    fracs[index] = maxOf(fracs[index], fraction.coerceIn(0.0, 1.0))
+                    val calculated = (
+                        jobs.indices.sumOf { fracs[it] * jobs[it].weightMs } / totalDur * 100
+                    ).toInt()
+                    highestOverall = maxOf(highestOverall, calculated)
+                    highestOverall
+                }
+                postPct(pct)
+            }
             val single = jobs.size == 1
             if (!single) stage("并行处理中（最多 3 个同时）…")
 
@@ -527,7 +535,7 @@ class MainActivity : AppCompatActivity() {
                             log = if (single) ::log
                             else { s -> synchronized(buf) { buf.appendLine(s); Unit } },
                             stage = if (single) ::stage else { _ -> },
-                            progress = { x -> fracs[i] = x.coerceIn(0.0, 1.0); overall() },
+                            progress = { x -> updateOverall(i, x) },
                         )
                         if (single) log("【${job.title}】")
                         val ft0 = System.currentTimeMillis()
@@ -539,8 +547,7 @@ class MainActivity : AppCompatActivity() {
                             ui.log("  失败：${e.message}")
                             false
                         }
-                        fracs[i] = 1.0
-                        overall()
+                        updateOverall(i, 1.0)
                         if (!single) {
                             synchronized(resultLogLock) {
                                 if (resultBlocks > 0) log("")
@@ -558,27 +565,21 @@ class MainActivity : AppCompatActivity() {
             log("")
             log("全部完成：成功 $ok 个，失败 ${jobs.size - ok} 个，总耗时 ${elapsed(t0)}。")
             if (ok > 0) log("成品在相册（或文件管理器）的 Movies/响度均衡 文件夹里。")
-            ProcessingService.finish(ok > 0, "成功 $ok 个，失败 ${jobs.size - ok} 个")
-            withContext(Dispatchers.Main) {
-                picked.forEach { it.thumbnail?.recycle() }
-                picked.clear()
-                setUiBusy(false)
-                refreshFileList()
+            ProcessingService.TaskResult(ok > 0, "成功 $ok 个，失败 ${jobs.size - ok} 个")
+            } finally {
+                withContext(Dispatchers.Main) {
+                    picked.forEach { it.thumbnail?.recycle() }
+                    picked.clear()
+                    setUiBusy(false)
+                    refreshFileList()
+                }
             }
         }
     }
 
     /** 只查询文件大小和磁盘余量，不读取视频内容，通常可在瞬间完成。 */
     private fun requiredFreeBytes(): Long {
-        fun sizeOf(pf: PickedFile): Long = try {
-            contentResolver.query(
-                pf.uri, arrayOf(OpenableColumns.SIZE), null, null, null
-            )?.use { c -> if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else 0L } ?: 0L
-        } catch (_: Exception) {
-            0L
-        }
-
-        val sizes = picked.associateWith(::sizeOf)
+        val sizes = picked.associateWith { contentSize(it.uri) }
         val concatBytes = if (willConcat()) {
             picked.filter { it.inConcat }.sumOf { sizes[it] ?: 0L }
         } else 0L
@@ -588,6 +589,14 @@ class MainActivity : AppCompatActivity() {
         // 普通输出约等于输入；拼接在峰值时还需容纳输入副本和合并文件。
         val estimatedPeak = singleBytes + concatBytes * 2
         return (estimatedPeak * 1.15).toLong() + 100L * 1024 * 1024
+    }
+
+    private fun contentSize(uri: Uri): Long = try {
+        contentResolver.query(uri, arrayOf(OpenableColumns.SIZE), null, null, null)?.use { c ->
+            if (c.moveToFirst() && !c.isNull(0)) c.getLong(0) else 0L
+        } ?: 0L
+    } catch (_: Exception) {
+        0L
     }
 
     private fun formatBytes(bytes: Long): String {
@@ -657,7 +666,6 @@ class MainActivity : AppCompatActivity() {
             values.clear()
             values.put(MediaStore.Video.Media.IS_PENDING, 0)
             contentResolver.update(outUri, values, null, null)
-            logFn("  完成 → Movies/响度均衡/$outName")
             return true
         } catch (e: Exception) {
             contentResolver.delete(outUri, null, null)
@@ -792,10 +800,24 @@ class MainActivity : AppCompatActivity() {
             }
 
             ui.stage("准备中：复制视频到缓存…")
+            val copyWeight = if (repair) 0.10 else 0.05
+            val copyTotal = files.sumOf { contentSize(it.uri) }
+            var copiedBytes = 0L
+            val copyBuffer = ByteArray(1024 * 1024)
             for ((i, pf) in files.withIndex()) {
                 val f = File(cacheDir, "cat_${stamp}_$i.mp4")
                 contentResolver.openInputStream(pf.uri)!!.use { ins ->
-                    f.outputStream().use { ins.copyTo(it) }
+                    f.outputStream().buffered().use { out ->
+                        while (true) {
+                            val n = ins.read(copyBuffer)
+                            if (n < 0) break
+                            out.write(copyBuffer, 0, n)
+                            copiedBytes += n
+                            if (copyTotal > 0) {
+                                ui.progress(copyWeight * copiedBytes / copyTotal)
+                            }
+                        }
+                    }
                 }
                 tmpCopies.add(f)
             }
@@ -804,14 +826,16 @@ class MainActivity : AppCompatActivity() {
             ui.stage("拼接中（无损，不重编码）…")
             if (repair) {
                 return encodeToGallery("$outBase.mp4", ui.log) { out ->
-                    runConcat(listFile.absolutePath, out) { ms -> ui.progress(ms / totalDur) }
+                    runConcat(listFile.absolutePath, out) { ms ->
+                        ui.progress(copyWeight + (1 - copyWeight) * ms / totalDur)
+                    }
                 }
             }
-            // 先无损拼到缓存（占总进度前 15%），再走正常均衡流程
+            // 复制占前 5%，无损拼接占 15%，响度均衡占后 80%。
             val merged = File(cacheDir, "merged_$stamp.mp4")
             try {
                 val s = runConcat(listFile.absolutePath, merged.absolutePath) { ms ->
-                    ui.progress(0.15 * ms / totalDur)
+                    ui.progress(copyWeight + 0.15 * ms / totalDur)
                 }
                 if (!ReturnCode.isSuccess(s.returnCode)) {
                     ui.log("  失败：拼接出错：")
@@ -820,7 +844,10 @@ class MainActivity : AppCompatActivity() {
                 }
                 // 输入副本用完即删，给均衡阶段腾缓存空间
                 tmpCopies.forEach { it.delete() }
-                val sub = JobUi(ui.log, ui.stage) { x -> ui.progress(0.15 + 0.85 * x) }
+                val processedBase = copyWeight + 0.15
+                val sub = JobUi(ui.log, ui.stage) { x ->
+                    ui.progress(processedBase + (1 - processedBase) * x)
+                }
                 return processInput(
                     { merged.absolutePath }, "$outBase.mp4", totalDur.toLong(), target, strength, sub
                 )
