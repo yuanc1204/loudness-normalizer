@@ -6,6 +6,7 @@ import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
@@ -16,6 +17,7 @@ import android.os.StatFs
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.text.TextUtils
+import android.util.Size
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -45,11 +47,13 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
@@ -86,6 +90,11 @@ class MainActivity : AppCompatActivity() {
 
     // 大多数手机只能稳定同时开启一个硬件视频编码器；裁剪任务在这里串行，其他任务仍可并行。
     private val preciseVideoEncodeLock = java.util.concurrent.Semaphore(1)
+
+    // 绕开部分系统串行生成视频封面的实现；最多并行三个轻量 FFmpeg 抽帧任务。
+    private val thumbnailExecutor = Executors.newFixedThreadPool(
+        Runtime.getRuntime().availableProcessors().coerceIn(1, 3)
+    )
 
     @Volatile
     private var notificationStage = "准备处理…"
@@ -178,6 +187,11 @@ class MainActivity : AppCompatActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleShareIntent(intent)
+    }
+
+    override fun onDestroy() {
+        thumbnailExecutor.shutdownNow()
+        super.onDestroy()
     }
 
     /** 接收从 Telegram 等 App 分享过来的视频，直接加进待处理列表。 */
@@ -363,45 +377,86 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 在后台读取视频画面并生成小尺寸预览，避免选择多个视频时阻塞界面。 */
+    /** 用独立 FFmpeg 线程池并行抽取低分辨率关键帧，系统缩略图仅作为失败兜底。 */
     private fun requestThumbnail(pf: PickedFile) {
         if (pf.thumbnailRequested) return
         pf.thumbnailRequested = true
         val revision = pf.editRevision
+        val hasEdits = pf.clipRanges != null
         val previewAtMs = pf.clipRanges?.firstOrNull()?.startMs ?: 0L
         lifecycleScope.launch {
-            val (bitmap, foundDurationMs) = withContext(Dispatchers.IO) {
-                val retriever = MediaMetadataRetriever()
-                try {
-                    retriever.setDataSource(this@MainActivity, pf.uri)
-                    val duration = retriever.extractMetadata(
-                        MediaMetadataRetriever.METADATA_KEY_DURATION
-                    )?.toLongOrNull() ?: 0L
-                    Pair(
-                        retriever.getScaledFrameAtTime(
-                            previewAtMs * 1000L,
-                            MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
-                            160,
-                            120,
-                        ),
-                        duration,
-                    )
-                } catch (_: Exception) {
-                    Pair(null, 0L)
-                } finally {
-                    retriever.release()
-                }
+            val bitmap = withContext(Dispatchers.IO) {
+                loadFfmpegThumbnail(pf.uri, previewAtMs)
+            } ?: withContext(Dispatchers.IO) {
+                if (hasEdits) loadThumbnailFrame(pf.uri, previewAtMs)
+                else loadSystemThumbnail(pf.uri) ?: loadThumbnailFrame(pf.uri, -1L)
             }
             if (revision != pf.editRevision || picked.indexOf(pf) < 0) {
                 bitmap?.recycle()
                 return@launch
             }
-            if (foundDurationMs > 0) pf.durationMs = foundDurationMs
             if (bitmap != null) {
                 pf.thumbnail = bitmap
                 val position = picked.indexOf(pf)
                 if (position >= 0) fileAdapter.notifyItemChanged(position)
             }
+        }
+    }
+
+    /** 每个任务只解码一个关键帧；显式线程池保证多个视频不会被系统抽帧器串行化。 */
+    private suspend fun loadFfmpegThumbnail(uri: Uri, positionMs: Long): Bitmap? =
+        suspendCancellableCoroutine { continuation ->
+            val output = File(cacheDir, "thumb_${System.nanoTime()}.jpg")
+            val seconds = String.format(
+                java.util.Locale.US,
+                "%.3f",
+                positionMs.coerceAtLeast(0L) / 1000.0,
+            )
+            val args = arrayOf(
+                "-hide_banner", "-loglevel", "error", "-y",
+                "-threads", "1",
+                "-skip_frame", "nokey",
+                "-ss", seconds,
+                "-i", FFmpegKitConfig.getSafParameterForRead(this, uri),
+                "-map", "0:v:0",
+                "-frames:v", "1",
+                "-an", "-sn",
+                "-vf", "scale=160:120:force_original_aspect_ratio=increase,crop=160:120",
+                "-c:v", "mjpeg", "-q:v", "5",
+                "-f", "image2", "-update", "1",
+                output.absolutePath,
+            )
+            FFmpegKit.executeWithArgumentsAsync(args, { session ->
+                val bitmap = if (ReturnCode.isSuccess(session.returnCode) && output.exists()) {
+                    BitmapFactory.decodeFile(output.absolutePath)
+                } else null
+                output.delete()
+                continuation.resume(bitmap) { bitmap?.recycle() }
+            }, thumbnailExecutor)
+        }
+
+    /** 让文件提供器直接返回它为系统选择器生成并缓存的小尺寸封面。 */
+    private fun loadSystemThumbnail(uri: Uri): Bitmap? = try {
+        contentResolver.loadThumbnail(uri, Size(160, 120), null)
+    } catch (_: Exception) {
+        null
+    }
+
+    /** 第三方文件提供器没有封面，或裁剪后需要指定画面时才启动视频解码器。 */
+    private fun loadThumbnailFrame(uri: Uri, positionMs: Long): Bitmap? {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(this, uri)
+            retriever.getScaledFrameAtTime(
+                if (positionMs < 0L) -1L else positionMs * 1000L,
+                MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                160,
+                120,
+            )
+        } catch (_: Exception) {
+            null
+        } finally {
+            retriever.release()
         }
     }
 
@@ -475,6 +530,8 @@ class MainActivity : AppCompatActivity() {
 
     @Suppress("NotifyDataSetChanged")
     private fun refreshFileList() {
+        // 选择完成后一次性发起全部请求，不再等 RecyclerView 逐行绑定。
+        picked.forEach(::requestThumbnail)
         fileAdapter.notifyDataSetChanged()
         rvFiles.visibility = if (busy || picked.isEmpty()) View.GONE else View.VISIBLE
         // 缩略图列表最多显示三行，更多视频在列表内滚动，给下面的日志区留空间。

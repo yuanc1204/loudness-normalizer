@@ -7,7 +7,7 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
-        android:label="响度均衡·裁剪版"
+        android:label="响度均衡"
         android:icon="@drawable/ic_launcher"
         android:allowBackup="false"
         android:theme="@style/Theme.App">
