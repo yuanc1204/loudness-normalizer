@@ -74,11 +74,18 @@ class MainActivity : AppCompatActivity() {
         var inConcat = false
         var thumbnail: Bitmap? = null
         var thumbnailRequested = false
+        var durationMs = 0L
+        var clipRanges: List<ClipRange>? = null
+        var editRevision = 0
     }
 
     private val picked = mutableListOf<PickedFile>()
     private var busy = false
     private val settings by lazy { getSharedPreferences("user_settings", MODE_PRIVATE) }
+    private var clipEditorLoading = false
+
+    // 大多数手机只能稳定同时开启一个硬件视频编码器；裁剪任务在这里串行，其他任务仍可并行。
+    private val preciseVideoEncodeLock = java.util.concurrent.Semaphore(1)
 
     @Volatile
     private var notificationStage = "准备处理…"
@@ -287,8 +294,8 @@ class MainActivity : AppCompatActivity() {
             }
             val name = TextView(parent.context).apply {
                 textSize = 13f
-                maxLines = 1
-                ellipsize = TextUtils.TruncateAt.MIDDLE
+                maxLines = 2
+                ellipsize = TextUtils.TruncateAt.END
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             }
             val cbCat = CheckBox(parent.context).apply {
@@ -313,13 +320,20 @@ class MainActivity : AppCompatActivity() {
 
         override fun onBindViewHolder(h: FileVH, position: Int) {
             val pf = picked[position]
-            h.name.text = pf.name
+            h.name.text = fileRowText(pf)
             val thumbnail = pf.thumbnail
             if (thumbnail != null) {
                 h.preview.setImageBitmap(thumbnail)
             } else {
                 h.preview.setImageResource(android.R.drawable.ic_media_play)
                 requestThumbnail(pf)
+            }
+            h.preview.isEnabled = !busy
+            h.preview.alpha = if (busy) 0.5f else 1f
+            h.preview.contentDescription = "裁剪 ${pf.name}"
+            h.preview.setOnClickListener {
+                val current = picked.getOrNull(h.bindingAdapterPosition) ?: return@setOnClickListener
+                if (!busy) showClipEditor(current)
             }
             h.handle.visibility = if (picked.size > 1) View.VISIBLE else View.GONE
             h.handle.setOnTouchListener { v, ev ->
@@ -343,7 +357,7 @@ class MainActivity : AppCompatActivity() {
             h.del.setOnClickListener {
                 val pos = h.bindingAdapterPosition
                 if (busy || pos == RecyclerView.NO_POSITION) return@setOnClickListener
-                picked.removeAt(pos)
+                picked.removeAt(pos).thumbnail?.recycle()
                 refreshFileList()
             }
         }
@@ -353,25 +367,76 @@ class MainActivity : AppCompatActivity() {
     private fun requestThumbnail(pf: PickedFile) {
         if (pf.thumbnailRequested) return
         pf.thumbnailRequested = true
+        val revision = pf.editRevision
+        val previewAtMs = pf.clipRanges?.firstOrNull()?.startMs ?: 0L
         lifecycleScope.launch {
-            val bitmap = withContext(Dispatchers.IO) {
+            val (bitmap, foundDurationMs) = withContext(Dispatchers.IO) {
                 val retriever = MediaMetadataRetriever()
                 try {
                     retriever.setDataSource(this@MainActivity, pf.uri)
-                    retriever.getScaledFrameAtTime(
-                        0,
-                        MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
-                        160,
-                        120,
+                    val duration = retriever.extractMetadata(
+                        MediaMetadataRetriever.METADATA_KEY_DURATION
+                    )?.toLongOrNull() ?: 0L
+                    Pair(
+                        retriever.getScaledFrameAtTime(
+                            previewAtMs * 1000L,
+                            MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                            160,
+                            120,
+                        ),
+                        duration,
                     )
                 } catch (_: Exception) {
-                    null
+                    Pair(null, 0L)
                 } finally {
                     retriever.release()
                 }
             }
+            if (revision != pf.editRevision || picked.indexOf(pf) < 0) {
+                bitmap?.recycle()
+                return@launch
+            }
+            if (foundDurationMs > 0) pf.durationMs = foundDurationMs
             if (bitmap != null) {
                 pf.thumbnail = bitmap
+                val position = picked.indexOf(pf)
+                if (position >= 0) fileAdapter.notifyItemChanged(position)
+            }
+        }
+    }
+
+    private fun fileRowText(pf: PickedFile): String {
+        val ranges = pf.clipRanges ?: return pf.name
+        val kept = ranges.sumOf { it.durationMs }
+        return "${pf.name}\n已裁剪：保留 ${ranges.size} 段 · ${formatShortTime(kept)}"
+    }
+
+    private fun showClipEditor(pf: PickedFile) {
+        if (clipEditorLoading) return
+        clipEditorLoading = true
+        lifecycleScope.launch {
+            val duration = try {
+                withContext(Dispatchers.IO) { sourceDurationMs(pf) }
+            } finally {
+                clipEditorLoading = false
+            }
+            if (busy || picked.indexOf(pf) < 0) return@launch
+            if (duration < 500L) {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("无法裁剪")
+                    .setMessage("没有读到有效的视频时长，或视频太短。")
+                    .setPositiveButton("知道了", null)
+                    .show()
+                return@launch
+            }
+            val initial = pf.clipRanges ?: listOf(ClipRange(0L, duration))
+            showClipEditorDialog(this@MainActivity, pf.uri, pf.name, duration, initial) { ranges ->
+                val normalized = normalizeClipRanges(ranges, duration)
+                pf.clipRanges = if (isFullClip(normalized, duration)) null else normalized
+                pf.editRevision++
+                pf.thumbnail?.recycle()
+                pf.thumbnail = null
+                pf.thumbnailRequested = false
                 val position = picked.indexOf(pf)
                 if (position >= 0) fileAdapter.notifyItemChanged(position)
             }
@@ -497,16 +562,16 @@ class MainActivity : AppCompatActivity() {
 
         val jobs = ArrayList<Job>()
         if (doConcat) {
-            val w = concatFiles.sumOf { durationMs(it.uri).coerceAtLeast(1L) }
+            val w = concatFiles.sumOf { effectiveDurationMs(it).coerceAtLeast(1L) }
             jobs.add(Job("拼接 ${concatFiles.size} 个视频", w) { ui ->
                 concatOne(concatFiles, repair, target, strength, ui)
             })
         }
         for (pf in singleFiles) {
-            val w = durationMs(pf.uri).coerceAtLeast(1L)
+            val w = effectiveDurationMs(pf).coerceAtLeast(1L)
             jobs.add(Job(pf.name, w) { ui ->
-                if (repair) repairOne(pf.uri, pf.name, ui)
-                else processOne(pf.uri, pf.name, target, strength, ui)
+                if (repair) repairOne(pf, ui)
+                else processOne(pf, target, strength, ui)
             })
         }
 
@@ -594,8 +659,11 @@ class MainActivity : AppCompatActivity() {
         val singleBytes = picked.filter { !willConcat() || !it.inConcat }.sumOf { sizes[it] ?: 0L }
         if (concatBytes + singleBytes == 0L) return 0L
 
-        // 普通输出约等于输入；拼接在峰值时还需容纳输入副本和合并文件。
-        val estimatedPeak = singleBytes + concatBytes * 2
+        // 裁剪过的单视频会先生成一个精确裁剪缓存；拼接在峰值时需容纳输入副本和合并文件。
+        val trimmedSingleBytes = picked.filter {
+            (!willConcat() || !it.inConcat) && it.clipRanges != null
+        }.sumOf { sizes[it] ?: 0L }
+        val estimatedPeak = singleBytes + trimmedSingleBytes + concatBytes * 2
         return (estimatedPeak * 1.15).toLong() + 100L * 1024 * 1024
     }
 
@@ -629,6 +697,28 @@ class MainActivity : AppCompatActivity() {
         }
     } catch (e: Exception) {
         0
+    }
+
+    private fun sourceDurationMs(pf: PickedFile): Long {
+        if (pf.durationMs > 0) return pf.durationMs
+        return durationMs(pf.uri).also { if (it > 0) pf.durationMs = it }
+    }
+
+    private fun clipRangesFor(pf: PickedFile): List<ClipRange> {
+        val duration = sourceDurationMs(pf)
+        return pf.clipRanges ?: if (duration > 0) listOf(ClipRange(0L, duration)) else emptyList()
+    }
+
+    private fun effectiveDurationMs(pf: PickedFile): Long =
+        pf.clipRanges?.sumOf { it.durationMs } ?: sourceDurationMs(pf)
+
+    private fun formatShortTime(ms: Long): String {
+        val totalSeconds = ms.coerceAtLeast(0L) / 1000L
+        val hours = totalSeconds / 3600L
+        val minutes = (totalSeconds / 60L) % 60L
+        val seconds = totalSeconds % 60L
+        return if (hours > 0) "%d:%02d:%02d".format(hours, minutes, seconds)
+        else "%02d:%02d".format(minutes, seconds)
     }
 
     /**
@@ -685,16 +775,175 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 仅修复播放卡顿：无损重新封装成标准 mp4（分片索引重建），不动音量。 */
-    private fun repairOne(uri: Uri, name: String, ui: JobUi): Boolean {
-        val dur = durationMs(uri).coerceAtLeast(1L)
-        ui.stage("修复封装（无损，不重编码）…")
-        val base = name.substringBeforeLast('.')
-        return encodeToGallery("${base}_修复.mp4", ui.log) { out ->
+    /** 为精确裁剪构造 trim/atrim + concat 滤镜；每个输出片段都从零时间戳开始。 */
+    private fun buildPreciseClipFilter(
+        rangesByInput: List<List<ClipRange>>, hasAudio: Boolean, pixelFormat: String,
+    ): String {
+        val filters = ArrayList<String>()
+        val concatInputs = StringBuilder()
+        var segment = 0
+        for ((inputIndex, ranges) in rangesByInput.withIndex()) {
+            for (range in ranges) {
+                val start = String.format(java.util.Locale.US, "%.3f", range.startMs / 1000.0)
+                val end = String.format(java.util.Locale.US, "%.3f", range.endMs / 1000.0)
+                filters.add(
+                    "[$inputIndex:v:0]setpts=PTS-STARTPTS,trim=start=$start:end=$end," +
+                        "setpts=PTS-STARTPTS[v$segment]"
+                )
+                concatInputs.append("[v$segment]")
+                if (hasAudio) {
+                    filters.add(
+                        "[$inputIndex:a:0]asetpts=PTS-STARTPTS,atrim=start=$start:end=$end," +
+                            "asetpts=PTS-STARTPTS,aresample=async=1:first_pts=0[a$segment]"
+                    )
+                    concatInputs.append("[a$segment]")
+                }
+                segment++
+            }
+        }
+        require(segment > 0) { "没有可保留的裁剪片段" }
+        if (segment == 1) {
+            filters.add("[v0]format=$pixelFormat[vout]")
+            if (hasAudio) filters.add("[a0]anull[aout]")
+        } else {
+            if (hasAudio) {
+                filters.add("${concatInputs}concat=n=$segment:v=1:a=1[vcat][aout]")
+            } else {
+                filters.add("${concatInputs}concat=n=$segment:v=1:a=0[vcat]")
+            }
+            filters.add("[vcat]format=$pixelFormat[vout]")
+        }
+        return filters.joinToString(";")
+    }
+
+    private fun preciseClipArgs(
+        inputProviders: List<() -> String>, rangesByInput: List<List<ClipRange>>,
+        hasAudio: Boolean, videoBitrate: Int, output: File, hardware: Boolean,
+    ): Array<String> {
+        val pixelFormat = if (hardware) "nv12" else "yuv420p"
+        val args = ArrayList<String>()
+        args.addAll(listOf("-hide_banner", "-y"))
+        for (provider in inputProviders) args.addAll(listOf("-i", provider()))
+        args.addAll(
+            listOf(
+                "-filter_complex", buildPreciseClipFilter(rangesByInput, hasAudio, pixelFormat),
+                "-map", "[vout]",
+            )
+        )
+        if (hasAudio) args.addAll(listOf("-map", "[aout]"))
+        if (hardware) {
+            args.addAll(
+                listOf(
+                    "-c:v", "h264_mediacodec",
+                    "-pix_fmt", "nv12",
+                    "-b:v", videoBitrate.coerceIn(2_000_000, 30_000_000).toString(),
+                    "-bitrate_mode", "vbr",
+                    "-bf", "0",
+                    "-g", "60",
+                )
+            )
+        } else {
+            // 极少数设备无法启动硬件编码器时仍保证裁剪可用。
+            args.addAll(
+                listOf(
+                    "-c:v", "mpeg4",
+                    "-pix_fmt", "yuv420p",
+                    "-q:v", "3",
+                    "-g", "60",
+                )
+            )
+        }
+        if (hasAudio) args.addAll(listOf("-c:a", "aac", "-b:a", "192k"))
+        else args.add("-an")
+        args.addAll(
+            listOf(
+                "-map_metadata", "-1",
+                "-map_chapters", "-1",
+                "-avoid_negative_ts", "make_zero",
+                "-max_muxing_queue_size", "2048",
+                "-movflags", "+faststart",
+                "-f", "mp4",
+                output.absolutePath,
+            )
+        )
+        return args.toTypedArray()
+    }
+
+    /**
+     * 任意分割点都要准确生效，因此裁剪过的视频在这里重新编码一次画面。
+     * 优先使用 Android 硬件 H.264；设备不支持时自动回退到内置兼容编码器。
+     */
+    private fun runPreciseClip(
+        inputProviders: List<() -> String>, rangesByInput: List<List<ClipRange>>,
+        hasAudio: Boolean, videoBitrate: Int, output: File,
+        logFn: (String) -> Unit, onTimeMs: ((Double) -> Unit)?,
+    ): FFmpegSession {
+        require(inputProviders.size == rangesByInput.size)
+        preciseVideoEncodeLock.acquire()
+        try {
+            output.delete()
+            val hardware = runFFmpeg(
+                preciseClipArgs(
+                    inputProviders, rangesByInput, hasAudio, videoBitrate, output, hardware = true
+                ),
+                onTimeMs = onTimeMs,
+            )
+            if (ReturnCode.isSuccess(hardware.returnCode)) return hardware
+
+            output.delete()
+            logFn("  当前设备的硬件裁剪编码不可用，自动改用兼容模式…")
+            return runFFmpeg(
+                preciseClipArgs(
+                    inputProviders, rangesByInput, hasAudio, videoBitrate, output, hardware = false
+                ),
+                onTimeMs = onTimeMs,
+            )
+        } finally {
+            preciseVideoEncodeLock.release()
+        }
+    }
+
+    /** 把一个已编辑视频的所有保留片段精确合成为缓存输入。 */
+    private fun createTrimmedInput(
+        pf: PickedFile, ui: JobUi, onFraction: (Double) -> Unit,
+    ): File? {
+        val ranges = pf.clipRanges ?: return null
+        val info = probeVideo(pf.uri)
+        if (info == null) {
+            ui.log("  失败：无法识别视频编码参数，不能裁剪")
+            return null
+        }
+        val keptDuration = ranges.sumOf { it.durationMs }.coerceAtLeast(1L).toDouble()
+        val output = File(cacheDir, "trim_${System.nanoTime()}.mp4")
+        ui.stage("裁剪中：生成保留片段…")
+        val session = runPreciseClip(
+            listOf { FFmpegKitConfig.getSafParameterForRead(this, pf.uri) },
+            listOf(ranges),
+            info.aMime != null,
+            info.bitrate,
+            output,
+            ui.log,
+            onTimeMs = { ms -> onFraction((ms / keptDuration).coerceIn(0.0, 1.0)) },
+        )
+        if (!ReturnCode.isSuccess(session.returnCode) || !output.exists()) {
+            ui.log("  失败：裁剪视频时出错：")
+            ui.log("  " + session.getAllLogsAsString(2000).lines().takeLast(6).joinToString("\n  "))
+            output.delete()
+            return null
+        }
+        onFraction(1.0)
+        return output
+    }
+
+    /** 把已生成的缓存 mp4 无损写入相册。 */
+    private fun savePreparedVideo(input: File, outName: String, durMs: Long, ui: JobUi): Boolean {
+        val dur = durMs.coerceAtLeast(1L).toDouble()
+        ui.stage("保存裁剪成品…")
+        return encodeToGallery(outName, ui.log) { out ->
             runFFmpeg(
                 arrayOf(
                     "-hide_banner", "-y",
-                    "-i", FFmpegKitConfig.getSafParameterForRead(this, uri),
+                    "-i", input.absolutePath,
                     "-map", "0:v?", "-map", "0:a?",
                     "-c", "copy",
                     "-f", "mp4",
@@ -702,6 +951,36 @@ class MainActivity : AppCompatActivity() {
                 ),
                 onTimeMs = { ms -> ui.progress(ms / dur) },
             )
+        }
+    }
+
+    /** 仅修复播放卡顿；若设置了裁剪，先精确生成保留片段再重新封装。 */
+    private fun repairOne(pf: PickedFile, ui: JobUi): Boolean {
+        val dur = effectiveDurationMs(pf).coerceAtLeast(1L)
+        val base = pf.name.substringBeforeLast('.')
+        if (pf.clipRanges == null) {
+            ui.stage("修复封装（无损，不重编码）…")
+            return encodeToGallery("${base}_修复.mp4", ui.log) { out ->
+                runFFmpeg(
+                    arrayOf(
+                        "-hide_banner", "-y",
+                        "-i", FFmpegKitConfig.getSafParameterForRead(this, pf.uri),
+                        "-map", "0:v?", "-map", "0:a?",
+                        "-c", "copy",
+                        "-f", "mp4",
+                        out,
+                    ),
+                    onTimeMs = { ms -> ui.progress(ms / dur) },
+                )
+            }
+        }
+
+        val trimmed = createTrimmedInput(pf, ui) { x -> ui.progress(0.8 * x) } ?: return false
+        return try {
+            val saveUi = JobUi(ui.log, ui.stage) { x -> ui.progress(0.8 + 0.2 * x) }
+            savePreparedVideo(trimmed, "${base}_修复.mp4", dur, saveUi)
+        } finally {
+            trimmed.delete()
         }
     }
 
@@ -726,7 +1005,7 @@ class MainActivity : AppCompatActivity() {
     /** 视频关键参数，用于判断能否无损拼接。 */
     private class VidInfo(
         val mime: String, val w: Int, val h: Int, val rot: Int, val csd: ByteArray?,
-        val aMime: String?, val aRate: Int, val aCh: Int,
+        val bitrate: Int, val aMime: String?, val aRate: Int, val aCh: Int,
     ) {
         fun desc(): String {
             val v = "${mime.removePrefix("video/")} ${w}x${h}" + (if (rot != 0) " 旋转${rot}°" else "")
@@ -741,6 +1020,7 @@ class MainActivity : AppCompatActivity() {
             try {
                 ex.setDataSource(pfd.fileDescriptor)
                 var mime = ""; var w = 0; var h = 0; var rot = 0
+                var bitrate = 8_000_000
                 var csd: ByteArray? = null
                 var aMime: String? = null; var aRate = 0; var aCh = 0
                 for (i in 0 until ex.trackCount) {
@@ -751,6 +1031,7 @@ class MainActivity : AppCompatActivity() {
                         w = f.getInteger(MediaFormat.KEY_WIDTH)
                         h = f.getInteger(MediaFormat.KEY_HEIGHT)
                         rot = try { f.getInteger(MediaFormat.KEY_ROTATION) } catch (e: Exception) { 0 }
+                        bitrate = try { f.getInteger(MediaFormat.KEY_BIT_RATE) } catch (e: Exception) { bitrate }
                         csd = try {
                             f.getByteBuffer("csd-0")?.let { b ->
                                 ByteArray(b.remaining()).also { b.get(it) }
@@ -762,7 +1043,8 @@ class MainActivity : AppCompatActivity() {
                         aCh = try { f.getInteger(MediaFormat.KEY_CHANNEL_COUNT) } catch (e: Exception) { 0 }
                     }
                 }
-                if (mime.isEmpty()) null else VidInfo(mime, w, h, rot, csd, aMime, aRate, aCh)
+                if (mime.isEmpty()) null
+                else VidInfo(mime, w, h, rot, csd, bitrate, aMime, aRate, aCh)
             } finally {
                 ex.release()
             }
@@ -779,8 +1061,9 @@ class MainActivity : AppCompatActivity() {
             a.aMime == b.aMime && a.aRate == b.aRate && a.aCh == b.aCh
 
     /**
-     * 拼接所有视频（仅无损 -c copy）。repair=true 时只拼接不调音量；
-     * 否则拼到缓存后再对合并结果做响度均衡。
+     * 拼接所有视频。没有裁剪时仍使用无损 -c copy；任一视频裁剪过时，
+     * 把所有保留片段一次性精确合并并编码，避免分割点受关键帧位置限制。
+     * repair=true 时只拼接不调音量；否则再对合并结果做响度均衡。
      * 各视频编码/分辨率/编码头/音频参数必须一致，否则 -c copy 会产出时长错乱、
      * 后段无法播放的坏文件——故先探测参数，不一致直接报错跳过，不生成坏文件。
      * 注意：concat 分段切换时关闭 saf 输入会原生崩溃（saf_close），
@@ -789,7 +1072,8 @@ class MainActivity : AppCompatActivity() {
     private fun concatOne(
         files: List<PickedFile>, repair: Boolean, target: Double, strength: Double, ui: JobUi,
     ): Boolean {
-        val totalDur = files.sumOf { durationMs(it.uri) }.coerceAtLeast(1L).toDouble()
+        val totalDur = files.sumOf { effectiveDurationMs(it) }.coerceAtLeast(1L).toDouble()
+        val hasClipEdits = files.any { it.clipRanges != null }
         val outBase = files.first().name.substringBeforeLast('.') + "_等${files.size}个拼接"
         val stamp = System.currentTimeMillis()
         val listFile = File(cacheDir, "concat_$stamp.txt")
@@ -803,7 +1087,7 @@ class MainActivity : AppCompatActivity() {
                 return false
             }
             if (infos.any { it == null || !sameParams(ref, it) }) {
-                ui.log("  失败：这些视频的编码参数不一致，无法无损拼接。")
+                ui.log("  失败：这些视频的编码参数不一致，无法拼接。")
                 ui.log("  （拼接要求编码、分辨率、旋转、音频参数完全相同，一般同一来源的视频才满足）")
                 for ((i, pf) in files.withIndex()) {
                     ui.log("    ${pf.name}：${infos[i]?.desc() ?: "无法识别"}")
@@ -833,6 +1117,49 @@ class MainActivity : AppCompatActivity() {
                 }
                 tmpCopies.add(f)
             }
+
+            if (hasClipEdits) {
+                val merged = File(cacheDir, "merged_clip_$stamp.mp4")
+                try {
+                    ui.stage("裁剪并拼接保留片段…")
+                    val clipWeight = if (repair) 0.75 else 0.30
+                    val session = runPreciseClip(
+                        tmpCopies.map { file -> ({ file.absolutePath }) },
+                        files.map { clipRangesFor(it) },
+                        ref.aMime != null,
+                        ref.bitrate,
+                        merged,
+                        ui.log,
+                        onTimeMs = { ms ->
+                            ui.progress(copyWeight + clipWeight * ms / totalDur)
+                        },
+                    )
+                    if (!ReturnCode.isSuccess(session.returnCode) || !merged.exists()) {
+                        ui.log("  失败：裁剪并拼接时出错：")
+                        ui.log(
+                            "  " + session.getAllLogsAsString(2000).lines()
+                                .takeLast(6).joinToString("\n  ")
+                        )
+                        return false
+                    }
+                    tmpCopies.forEach { it.delete() }
+                    val processedBase = copyWeight + clipWeight
+                    val sub = JobUi(ui.log, ui.stage) { x ->
+                        ui.progress(processedBase + (1 - processedBase) * x)
+                    }
+                    return if (repair) {
+                        savePreparedVideo(merged, "$outBase.mp4", totalDur.toLong(), sub)
+                    } else {
+                        processInput(
+                            { merged.absolutePath }, "$outBase.mp4", totalDur.toLong(),
+                            target, strength, sub,
+                        )
+                    }
+                } finally {
+                    merged.delete()
+                }
+            }
+
             listFile.writeText(tmpCopies.joinToString("") { "file '${it.absolutePath}'\n" })
 
             ui.stage("拼接中（无损，不重编码）…")
@@ -872,12 +1199,32 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 完整处理一个视频：扫描（含真峰值）→ 本地计算测量值 → 编码 → 存入相册。 */
-    private fun processOne(uri: Uri, name: String, target: Double, strength: Double, ui: JobUi): Boolean =
-        processInput(
-            { FFmpegKitConfig.getSafParameterForRead(this, uri) },
-            name, durationMs(uri), target, strength, ui,
-        )
+    /** 完整处理一个视频：可选精确裁剪 → 扫描响度 → 计算增益 → 生成并存入相册。 */
+    private fun processOne(
+        pf: PickedFile, target: Double, strength: Double, ui: JobUi,
+    ): Boolean {
+        if (pf.clipRanges == null) {
+            return processInput(
+                { FFmpegKitConfig.getSafParameterForRead(this, pf.uri) },
+                pf.name, sourceDurationMs(pf), target, strength, ui,
+            )
+        }
+
+        val trimWeight = 0.35
+        val trimmed = createTrimmedInput(pf, ui) { x -> ui.progress(trimWeight * x) }
+            ?: return false
+        return try {
+            val sub = JobUi(ui.log, ui.stage) { x ->
+                ui.progress(trimWeight + (1 - trimWeight) * x)
+            }
+            processInput(
+                { trimmed.absolutePath }, pf.name, effectiveDurationMs(pf),
+                target, strength, sub,
+            )
+        } finally {
+            trimmed.delete()
+        }
+    }
 
     /**
      * 响度均衡主流程。input 每次调用返回一个可用的 ffmpeg 输入（saf 参数或缓存文件路径）。

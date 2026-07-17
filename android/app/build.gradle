@@ -8,11 +8,11 @@ android {
     compileSdk 34
 
     defaultConfig {
-        applicationId "com.yc.loudnorm"
+        applicationId "com.yc.loudnorm.editor"
         minSdk 29
         targetSdk 34
-        versionCode 24
-        versionName "2.6.0"
+        versionCode 26
+        versionName "2.6.2"
         ndk {
             // 只保留手机常见架构，控制 APK 体积
             abiFilters 'arm64-v8a', 'armeabi-v7a'

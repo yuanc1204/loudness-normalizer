@@ -16,7 +16,7 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="4dp"
-        android:text="小声段整段提升，大声段基本不动，画质无损"
+        android:text="小声段整段提升；未裁剪画面无损，可分割删除片段"
         android:textSize="13sp" />
 
     <Button
@@ -46,6 +46,13 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="4dp" />
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:text="点击视频预览图可裁剪；分割后点选片段即可删除"
+        android:textSize="12sp" />
 
     <TextView
         android:id="@+id/tvTarget"
