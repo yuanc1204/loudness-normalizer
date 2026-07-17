@@ -7,6 +7,7 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Paint
+import android.media.MediaMetadataRetriever
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Handler
@@ -208,9 +209,74 @@ fun showClipEditorDialog(
     var pendingFramePositionMs: Long? = null
     var frameInFlight = false
     var lastPlaybackFrameMs = -PREVIEW_FRAME_INTERVAL_MS
+    var preferSystemFrameExtractor = false
+    var systemFrameExtractor: MediaMetadataRetriever? = null
 
     /**
-     * 用内置 FFmpeg 解码预览帧，不依赖部分手机会黑屏的系统抽帧器。
+     * 系统相册能播放但 FFmpeg 无法解码或跳转的视频（常见于聊天应用下载的视频）走此路径。
+     * 抽帧器只在单线程 frameExecutor 中创建和使用，避免跨线程访问系统解码器。
+     */
+    fun loadSystemFrame(positionMs: Long): Bitmap? {
+        val retriever = systemFrameExtractor ?: MediaMetadataRetriever().let { candidate ->
+            try {
+                candidate.setDataSource(context, uri)
+                systemFrameExtractor = candidate
+                candidate
+            } catch (_: Exception) {
+                candidate.release()
+                return null
+            }
+        }
+        val timeUs = positionMs.coerceAtLeast(0L).coerceAtMost(Long.MAX_VALUE / 1000L) * 1000L
+        return try {
+            retriever.getScaledFrameAtTime(
+                timeUs,
+                MediaMetadataRetriever.OPTION_CLOSEST,
+                PREVIEW_MAX_DIMENSION,
+                PREVIEW_MAX_DIMENSION,
+            ) ?: retriever.getScaledFrameAtTime(
+                timeUs,
+                MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
+                PREVIEW_MAX_DIMENSION,
+                PREVIEW_MAX_DIMENSION,
+            )
+        } catch (_: Exception) {
+            systemFrameExtractor?.release()
+            systemFrameExtractor = null
+            null
+        }
+    }
+
+    fun loadFfmpegFrame(positionMs: Long): Bitmap? {
+        val output = File(context.cacheDir, "preview_${System.nanoTime()}.jpg")
+        return try {
+            val seconds = String.format(Locale.US, "%.3f", positionMs / 1000.0)
+            val session = FFmpegKit.executeWithArguments(
+                arrayOf(
+                    "-hide_banner", "-loglevel", "error", "-y",
+                    "-ss", seconds,
+                    "-i", FFmpegKitConfig.getSafParameterForRead(context, uri),
+                    "-map", "0:v:0",
+                    "-frames:v", "1",
+                    "-an",
+                    "-vf", "scale=720:720:force_original_aspect_ratio=decrease",
+                    "-c:v", "mjpeg", "-q:v", "3",
+                    "-f", "image2",
+                    output.absolutePath,
+                )
+            )
+            if (ReturnCode.isSuccess(session.returnCode) && output.exists()) {
+                BitmapFactory.decodeFile(output.absolutePath)
+            } else null
+        } catch (_: Exception) {
+            null
+        } finally {
+            output.delete()
+        }
+    }
+
+    /**
+     * 优先用内置 FFmpeg 解码；失败后改用系统解码器，兼容相册可播但 FFmpeg 不支持的视频。
      * 始终只处理一个请求；拖动很快时保留最新位置，避免启动大量 FFmpeg 会话。
      */
     fun startNextFrameRequest() {
@@ -220,38 +286,16 @@ fun showClipEditorDialog(
         val generation = frameGeneration.get()
         frameInFlight = true
         frameExecutor.execute {
-            val output = File(context.cacheDir, "preview_${System.nanoTime()}.jpg")
-            val bitmap = try {
-                val seconds = String.format(Locale.US, "%.3f", requestedAt / 1000.0)
-                val session = FFmpegKit.executeWithArguments(
-                    arrayOf(
-                        "-hide_banner", "-loglevel", "error", "-y",
-                        "-ss", seconds,
-                        "-i", FFmpegKitConfig.getSafParameterForRead(context, uri),
-                        "-map", "0:v:0",
-                        "-frames:v", "1",
-                        "-an",
-                        "-vf", "scale=720:720:force_original_aspect_ratio=decrease",
-                        "-c:v", "mjpeg", "-q:v", "3",
-                        "-f", "image2",
-                        output.absolutePath,
-                    )
-                )
-                if (ReturnCode.isSuccess(session.returnCode) && output.exists()) {
-                    BitmapFactory.decodeFile(output.absolutePath)
-                } else null
-            } catch (_: Exception) {
-                null
-            } finally {
-                output.delete()
-            }
+            val ffmpegBitmap = if (preferSystemFrameExtractor) null else loadFfmpegFrame(requestedAt)
+            val bitmap = ffmpegBitmap ?: loadSystemFrame(requestedAt)
+            if (ffmpegBitmap == null && bitmap != null) preferSystemFrameExtractor = true
             handler.post {
                 frameInFlight = false
                 if (frameClosed.get() || generation != frameGeneration.get()) {
                     bitmap?.recycle()
                 } else if (bitmap == null) {
                     if (displayedFrame == null) {
-                        previewStatus.text = "FFmpeg 无法取得此位置画面"
+                        previewStatus.text = "无法取得此位置画面，可尝试点播放"
                         previewStatus.visibility = View.VISIBLE
                     }
                 } else {
@@ -277,7 +321,7 @@ fun showClipEditorDialog(
         pendingFramePositionMs = requestedAt
         pendingFrameRequest?.let { handler.removeCallbacks(it) }
         if (displayedFrame == null) {
-            previewStatus.text = "FFmpeg 正在生成预览…"
+            previewStatus.text = "正在生成预览…"
             previewStatus.visibility = View.VISIBLE
         }
         val request = Runnable {
@@ -405,7 +449,7 @@ fun showClipEditorDialog(
             video.start()
             stillFrame.visibility = View.VISIBLE
             if (displayedFrame == null) {
-                previewStatus.text = "FFmpeg 正在生成预览…"
+                previewStatus.text = "正在生成预览…"
                 previewStatus.visibility = View.VISIBLE
             }
             lastPlaybackFrameMs = start - PREVIEW_FRAME_INTERVAL_MS
@@ -526,6 +570,10 @@ fun showClipEditorDialog(
         stillFrame.setImageDrawable(null)
         displayedFrame?.recycle()
         displayedFrame = null
+        frameExecutor.execute {
+            systemFrameExtractor?.release()
+            systemFrameExtractor = null
+        }
         frameExecutor.shutdown()
     }
     dialog.show()
@@ -533,6 +581,7 @@ fun showClipEditorDialog(
 
 private const val MIN_CLIP_PART_MS = 250L
 private const val PREVIEW_FRAME_INTERVAL_MS = 400L
+private const val PREVIEW_MAX_DIMENSION = 720
 
 private fun formatClipTime(ms: Long): String {
     val safe = ms.coerceAtLeast(0L)
