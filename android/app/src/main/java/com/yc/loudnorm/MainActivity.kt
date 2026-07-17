@@ -53,7 +53,9 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
@@ -72,6 +74,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var pbFile: ProgressBar
     private lateinit var cbRepair: CheckBox
     private lateinit var cbConcat: CheckBox
+    private lateinit var cbFast: CheckBox
 
     // inConcat：该视频是否被选入拼接组（勾选的视频合并成一个，按列表顺序）
     private class PickedFile(val uri: Uri, val name: String) {
@@ -87,6 +90,10 @@ class MainActivity : AppCompatActivity() {
     private var busy = false
     private val settings by lazy { getSharedPreferences("user_settings", MODE_PRIVATE) }
     private var clipEditorLoading = false
+    private val cancelRequested = AtomicBoolean(false)
+    private val activeSessionIds = ConcurrentHashMap.newKeySet<Long>()
+
+    private class ProcessingCanceledException : RuntimeException()
 
     // 大多数手机只能稳定同时开启一个硬件视频编码器；裁剪任务在这里串行，其他任务仍可并行。
     private val preciseVideoEncodeLock = java.util.concurrent.Semaphore(1)
@@ -142,9 +149,11 @@ class MainActivity : AppCompatActivity() {
         pbFile = findViewById(R.id.pbFile)
         cbRepair = findViewById(R.id.cbRepair)
         cbConcat = findViewById(R.id.cbConcat)
+        cbFast = findViewById(R.id.cbFast)
 
         sbTarget.progress = settings.getInt("target_progress", 4).coerceIn(0, sbTarget.max)
         sbStrength.progress = settings.getInt("strength_progress", 35).coerceIn(0, sbStrength.max)
+        cbFast.isChecked = settings.getBoolean("fast_mode", false)
         tvTarget.text = "目标响度：${targetLufs().toInt()} LUFS"
         tvStrength.text = "均衡力度：${(strength() * 100).toInt()}%"
 
@@ -161,6 +170,9 @@ class MainActivity : AppCompatActivity() {
             sbStrength.isEnabled = !checked && !busy
             updateStartText()
         }
+        cbFast.setOnCheckedChangeListener { _, checked ->
+            settings.edit().putBoolean("fast_mode", checked).apply()
+        }
         // 底部「拼接」是总开关：勾选=全选所有视频进拼接组，取消=全不选
         cbConcat.setOnCheckedChangeListener { _, checked ->
             if (syncingConcat) return@setOnCheckedChangeListener
@@ -170,7 +182,16 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnPick.setOnClickListener { pickVideos.launch(arrayOf("video/*")) }
-        btnStart.setOnClickListener { startProcessing() }
+        btnStart.setOnClickListener {
+            if (busy) {
+                ProcessingService.cancel()
+                cancelRequested.set(true)
+                tvStage.text = "正在取消并清理…"
+                updateStartText()
+            } else {
+                startProcessing()
+            }
+        }
 
         if (ProcessingService.isRunning) {
             setUiBusy(true)
@@ -238,11 +259,37 @@ class MainActivity : AppCompatActivity() {
      * 同步执行 ffmpeg，但走会话级回调：并行跑多个会话时，
      * 各自的日志行和编码统计只回到自己的任务，不会像全局回调那样串台。
      */
+    private fun throwIfCancelled() {
+        if (cancelRequested.get()) throw ProcessingCanceledException()
+    }
+
+    private fun requestCancellation() {
+        if (!cancelRequested.compareAndSet(false, true)) return
+        notificationStage = "正在取消并清理…"
+        ProcessingService.update(lastPct.coerceAtLeast(0), notificationStage)
+        runOnUiThread {
+            tvStage.text = notificationStage
+            updateStartText()
+        }
+        activeSessionIds.toList().forEach(FFmpegKit::cancel)
+    }
+
+    private fun copyWithCancellation(input: java.io.InputStream, output: java.io.OutputStream) {
+        val buffer = ByteArray(1024 * 1024)
+        while (true) {
+            throwIfCancelled()
+            val count = input.read(buffer)
+            if (count < 0) return
+            output.write(buffer, 0, count)
+        }
+    }
+
     private fun runFFmpeg(
         args: Array<String>,
         onLogLine: ((String) -> Unit)? = null,
         onTimeMs: ((Double) -> Unit)? = null,
     ): FFmpegSession {
+        throwIfCancelled()
         val latch = CountDownLatch(1)
         val session = FFmpegKit.executeWithArgumentsAsync(
             args,
@@ -250,7 +297,14 @@ class MainActivity : AppCompatActivity() {
             { l -> onLogLine?.invoke(l.message ?: "") },
             { st -> onTimeMs?.invoke(st.time.toDouble()) },
         )
-        latch.await()
+        activeSessionIds.add(session.sessionId)
+        if (cancelRequested.get()) FFmpegKit.cancel(session.sessionId)
+        try {
+            latch.await()
+        } finally {
+            activeSessionIds.remove(session.sessionId)
+        }
+        throwIfCancelled()
         return session
     }
 
@@ -261,6 +315,11 @@ class MainActivity : AppCompatActivity() {
     private fun willConcat() = picked.count { it.inConcat } >= 2
 
     private fun updateStartText() {
+        if (busy) {
+            btnStart.text = if (cancelRequested.get()) "正在取消…" else "取消处理"
+            btnStart.isEnabled = !cancelRequested.get()
+            return
+        }
         val repair = cbRepair.isChecked
         btnStart.text = when {
             willConcat() && repair -> "拼接并修复"
@@ -541,7 +600,7 @@ class MainActivity : AppCompatActivity() {
             else ViewGroup.LayoutParams.WRAP_CONTENT
         }
         tvSelected.text = if (picked.isEmpty()) "未选择视频" else "已选择 ${picked.size} 个视频"
-        btnStart.isEnabled = picked.isNotEmpty() && !busy
+        btnStart.isEnabled = if (busy) !cancelRequested.get() else picked.isNotEmpty()
         cbConcat.isEnabled = picked.size > 1 && !busy
         syncMasterConcat()
         updateStartText()
@@ -560,12 +619,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun setUiBusy(b: Boolean) {
         busy = b
+        if (!b) cancelRequested.set(false)
         btnPick.isEnabled = !b
-        btnStart.isEnabled = !b && picked.isNotEmpty()
+        btnStart.isEnabled = if (b) !cancelRequested.get() else picked.isNotEmpty()
         sbTarget.isEnabled = !b && !cbRepair.isChecked
         sbStrength.isEnabled = !b && !cbRepair.isChecked
         cbRepair.isEnabled = !b
         cbConcat.isEnabled = !b && picked.size > 1
+        cbFast.isEnabled = !b
         rvFiles.visibility = if (b || picked.isEmpty()) View.GONE else View.VISIBLE
         fileAdapter.notifyDataSetChanged()   // 重新绑定，让每行「拼接」勾选框随忙碌禁用
         pbFile.visibility = if (b) View.VISIBLE else View.INVISIBLE
@@ -577,6 +638,7 @@ class MainActivity : AppCompatActivity() {
             window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             tvStage.text = ""
         }
+        updateStartText()
     }
 
     /** 一个并行任务：一段拼接组或一个单独视频。weightMs 用于进度按时长加权。 */
@@ -606,7 +668,9 @@ class MainActivity : AppCompatActivity() {
         val target = targetLufs()
         val strength = strength()
         val repair = cbRepair.isChecked
+        val fastMode = cbFast.isChecked
         val files = picked.toList()
+        cancelRequested.set(false)
         setUiBusy(true)
         tvLog.text = ""
         notificationStage = "准备处理…"
@@ -621,18 +685,18 @@ class MainActivity : AppCompatActivity() {
         if (doConcat) {
             val w = concatFiles.sumOf { effectiveDurationMs(it).coerceAtLeast(1L) }
             jobs.add(Job("拼接 ${concatFiles.size} 个视频", w) { ui ->
-                concatOne(concatFiles, repair, target, strength, ui)
+                concatOne(concatFiles, repair, target, strength, fastMode, ui)
             })
         }
         for (pf in singleFiles) {
             val w = effectiveDurationMs(pf).coerceAtLeast(1L)
             jobs.add(Job(pf.name, w) { ui ->
-                if (repair) repairOne(pf, ui)
-                else processOne(pf, target, strength, ui)
+                if (repair) repairOne(pf, fastMode, ui)
+                else processOne(pf, target, strength, fastMode, ui)
             })
         }
 
-        ProcessingService.start(this) {
+        ProcessingService.start(this, ::requestCancellation) {
             try {
             val t0 = System.currentTimeMillis()
             // 进度条显示按时长加权的总进度；日志按任务缓冲、完成后整块输出，避免交错
@@ -670,15 +734,18 @@ class MainActivity : AppCompatActivity() {
                         if (single) log("【${job.title}】")
                         val ft0 = System.currentTimeMillis()
                         val okOne = try {
+                            throwIfCancelled()
                             val r = job.run(ui)
                             if (r) ui.log("  耗时 ${elapsed(ft0)}")
                             r
+                        } catch (_: ProcessingCanceledException) {
+                            false
                         } catch (e: Exception) {
                             ui.log("  失败：${e.message}")
                             false
                         }
-                        updateOverall(i, 1.0)
-                        if (!single) {
+                        if (!cancelRequested.get()) updateOverall(i, 1.0)
+                        if (!single && !cancelRequested.get()) {
                             synchronized(resultLogLock) {
                                 if (resultBlocks > 0) log("")
                                 resultBlocks++
@@ -691,15 +758,24 @@ class MainActivity : AppCompatActivity() {
                 }
             }.awaitAll()
 
-            val ok = results.count { it }
-            log("")
-            log("全部完成：成功 $ok 个，失败 ${jobs.size - ok} 个，总耗时 ${elapsed(t0)}。")
-            if (ok > 0) log("成品在相册（或文件管理器）的 Movies/响度均衡 文件夹里。")
-            ProcessingService.TaskResult(ok > 0, "成功 $ok 个，失败 ${jobs.size - ok} 个")
+            if (cancelRequested.get()) {
+                log("")
+                log("已取消处理，未完成的成品和缓存已删除。")
+                ProcessingService.TaskResult(false, "处理已取消", cancelled = true)
+            } else {
+                val ok = results.count { it }
+                log("")
+                log("全部完成：成功 $ok 个，失败 ${jobs.size - ok} 个，总耗时 ${elapsed(t0)}。")
+                if (ok > 0) log("成品在相册（或文件管理器）的 Movies/响度均衡 文件夹里。")
+                ProcessingService.TaskResult(ok > 0, "成功 $ok 个，失败 ${jobs.size - ok} 个")
+            }
             } finally {
+                val wasCanceled = cancelRequested.get()
                 withContext(Dispatchers.Main) {
-                    picked.forEach { it.thumbnail?.recycle() }
-                    picked.clear()
+                    if (!wasCanceled) {
+                        picked.forEach { it.thumbnail?.recycle() }
+                        picked.clear()
+                    }
                     setUiBusy(false)
                     refreshFileList()
                 }
@@ -807,13 +883,16 @@ class MainActivity : AppCompatActivity() {
                 enc.getAllLogsAsString(2000).contains("non seekable")
             ) {
                 val tmp = File(cacheDir, "out_${System.nanoTime()}.mp4")
-                enc = encode(tmp.absolutePath)
-                if (ReturnCode.isSuccess(enc.returnCode) && tmp.exists()) {
-                    contentResolver.openOutputStream(outUri)!!.use { os ->
-                        tmp.inputStream().use { it.copyTo(os) }
+                try {
+                    enc = encode(tmp.absolutePath)
+                    if (ReturnCode.isSuccess(enc.returnCode) && tmp.exists()) {
+                        contentResolver.openOutputStream(outUri)!!.use { os ->
+                            tmp.inputStream().use { copyWithCancellation(it, os) }
+                        }
                     }
+                } finally {
+                    tmp.delete()
                 }
-                tmp.delete()
             }
             if (!ReturnCode.isSuccess(enc.returnCode)) {
                 logFn("  失败：ffmpeg 处理出错：")
@@ -873,9 +952,14 @@ class MainActivity : AppCompatActivity() {
         return filters.joinToString(";")
     }
 
+    private fun aacArgs(fastMode: Boolean): List<String> =
+        if (fastMode) listOf("-c:a", "aac", "-b:a", "192k", "-aac_coder", "fast")
+        else listOf("-c:a", "aac", "-b:a", "192k")
+
     private fun preciseClipArgs(
         inputProviders: List<() -> String>, rangesByInput: List<List<ClipRange>>,
         hasAudio: Boolean, videoBitrate: Int, output: File, hardware: Boolean,
+        fastMode: Boolean,
     ): Array<String> {
         val pixelFormat = if (hardware) "nv12" else "yuv420p"
         val args = ArrayList<String>()
@@ -910,7 +994,7 @@ class MainActivity : AppCompatActivity() {
                 )
             )
         }
-        if (hasAudio) args.addAll(listOf("-c:a", "aac", "-b:a", "192k"))
+        if (hasAudio) args.addAll(aacArgs(fastMode))
         else args.add("-an")
         args.addAll(
             listOf(
@@ -933,7 +1017,7 @@ class MainActivity : AppCompatActivity() {
     private fun runPreciseClip(
         inputProviders: List<() -> String>, rangesByInput: List<List<ClipRange>>,
         hasAudio: Boolean, videoBitrate: Int, output: File,
-        logFn: (String) -> Unit, onTimeMs: ((Double) -> Unit)?,
+        fastMode: Boolean, logFn: (String) -> Unit, onTimeMs: ((Double) -> Unit)?,
     ): FFmpegSession {
         require(inputProviders.size == rangesByInput.size)
         preciseVideoEncodeLock.acquire()
@@ -941,7 +1025,8 @@ class MainActivity : AppCompatActivity() {
             output.delete()
             val hardware = runFFmpeg(
                 preciseClipArgs(
-                    inputProviders, rangesByInput, hasAudio, videoBitrate, output, hardware = true
+                    inputProviders, rangesByInput, hasAudio, videoBitrate, output,
+                    hardware = true, fastMode = fastMode,
                 ),
                 onTimeMs = onTimeMs,
             )
@@ -951,7 +1036,8 @@ class MainActivity : AppCompatActivity() {
             logFn("  当前设备的硬件裁剪编码不可用，自动改用兼容模式…")
             return runFFmpeg(
                 preciseClipArgs(
-                    inputProviders, rangesByInput, hasAudio, videoBitrate, output, hardware = false
+                    inputProviders, rangesByInput, hasAudio, videoBitrate, output,
+                    hardware = false, fastMode = fastMode,
                 ),
                 onTimeMs = onTimeMs,
             )
@@ -962,7 +1048,7 @@ class MainActivity : AppCompatActivity() {
 
     /** 把一个已编辑视频的所有保留片段精确合成为缓存输入。 */
     private fun createTrimmedInput(
-        pf: PickedFile, ui: JobUi, onFraction: (Double) -> Unit,
+        pf: PickedFile, fastMode: Boolean, ui: JobUi, onFraction: (Double) -> Unit,
     ): File? {
         val ranges = pf.clipRanges ?: return null
         val info = probeVideo(pf.uri)
@@ -973,15 +1059,21 @@ class MainActivity : AppCompatActivity() {
         val keptDuration = ranges.sumOf { it.durationMs }.coerceAtLeast(1L).toDouble()
         val output = File(cacheDir, "trim_${System.nanoTime()}.mp4")
         ui.stage("裁剪中：生成保留片段…")
-        val session = runPreciseClip(
-            listOf { FFmpegKitConfig.getSafParameterForRead(this, pf.uri) },
-            listOf(ranges),
-            info.aMime != null,
-            info.bitrate,
-            output,
-            ui.log,
-            onTimeMs = { ms -> onFraction((ms / keptDuration).coerceIn(0.0, 1.0)) },
-        )
+        val session = try {
+            runPreciseClip(
+                listOf { FFmpegKitConfig.getSafParameterForRead(this, pf.uri) },
+                listOf(ranges),
+                info.aMime != null,
+                info.bitrate,
+                output,
+                fastMode,
+                ui.log,
+                onTimeMs = { ms -> onFraction((ms / keptDuration).coerceIn(0.0, 1.0)) },
+            )
+        } catch (e: Exception) {
+            output.delete()
+            throw e
+        }
         if (!ReturnCode.isSuccess(session.returnCode) || !output.exists()) {
             ui.log("  失败：裁剪视频时出错：")
             ui.log("  " + session.getAllLogsAsString(2000).lines().takeLast(6).joinToString("\n  "))
@@ -1012,7 +1104,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** 仅修复播放卡顿；若设置了裁剪，先精确生成保留片段再重新封装。 */
-    private fun repairOne(pf: PickedFile, ui: JobUi): Boolean {
+    private fun repairOne(pf: PickedFile, fastMode: Boolean, ui: JobUi): Boolean {
         val dur = effectiveDurationMs(pf).coerceAtLeast(1L)
         val base = pf.name.substringBeforeLast('.')
         if (pf.clipRanges == null) {
@@ -1032,7 +1124,8 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        val trimmed = createTrimmedInput(pf, ui) { x -> ui.progress(0.8 * x) } ?: return false
+        val trimmed = createTrimmedInput(pf, fastMode, ui) { x -> ui.progress(0.8 * x) }
+            ?: return false
         return try {
             val saveUi = JobUi(ui.log, ui.stage) { x -> ui.progress(0.8 + 0.2 * x) }
             savePreparedVideo(trimmed, "${base}_修复.mp4", dur, saveUi)
@@ -1127,7 +1220,8 @@ class MainActivity : AppCompatActivity() {
      * 所以输入必须先复制成缓存里的真实文件，不能用 saf 协议直读。
      */
     private fun concatOne(
-        files: List<PickedFile>, repair: Boolean, target: Double, strength: Double, ui: JobUi,
+        files: List<PickedFile>, repair: Boolean, target: Double, strength: Double,
+        fastMode: Boolean, ui: JobUi,
     ): Boolean {
         val totalDur = files.sumOf { effectiveDurationMs(it) }.coerceAtLeast(1L).toDouble()
         val hasClipEdits = files.any { it.clipRanges != null }
@@ -1159,9 +1253,11 @@ class MainActivity : AppCompatActivity() {
             val copyBuffer = ByteArray(1024 * 1024)
             for ((i, pf) in files.withIndex()) {
                 val f = File(cacheDir, "cat_${stamp}_$i.mp4")
+                tmpCopies.add(f)
                 contentResolver.openInputStream(pf.uri)!!.use { ins ->
                     f.outputStream().buffered().use { out ->
                         while (true) {
+                            throwIfCancelled()
                             val n = ins.read(copyBuffer)
                             if (n < 0) break
                             out.write(copyBuffer, 0, n)
@@ -1172,7 +1268,6 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
                 }
-                tmpCopies.add(f)
             }
 
             if (hasClipEdits) {
@@ -1186,6 +1281,7 @@ class MainActivity : AppCompatActivity() {
                         ref.aMime != null,
                         ref.bitrate,
                         merged,
+                        fastMode,
                         ui.log,
                         onTimeMs = { ms ->
                             ui.progress(copyWeight + clipWeight * ms / totalDur)
@@ -1209,7 +1305,7 @@ class MainActivity : AppCompatActivity() {
                     } else {
                         processInput(
                             { merged.absolutePath }, "$outBase.mp4", totalDur.toLong(),
-                            target, strength, sub,
+                            target, strength, fastMode, sub,
                         )
                     }
                 } finally {
@@ -1245,7 +1341,8 @@ class MainActivity : AppCompatActivity() {
                     ui.progress(processedBase + (1 - processedBase) * x)
                 }
                 return processInput(
-                    { merged.absolutePath }, "$outBase.mp4", totalDur.toLong(), target, strength, sub
+                    { merged.absolutePath }, "$outBase.mp4", totalDur.toLong(),
+                    target, strength, fastMode, sub,
                 )
             } finally {
                 merged.delete()
@@ -1258,17 +1355,17 @@ class MainActivity : AppCompatActivity() {
 
     /** 完整处理一个视频：可选精确裁剪 → 扫描响度 → 计算增益 → 生成并存入相册。 */
     private fun processOne(
-        pf: PickedFile, target: Double, strength: Double, ui: JobUi,
+        pf: PickedFile, target: Double, strength: Double, fastMode: Boolean, ui: JobUi,
     ): Boolean {
         if (pf.clipRanges == null) {
             return processInput(
                 { FFmpegKitConfig.getSafParameterForRead(this, pf.uri) },
-                pf.name, sourceDurationMs(pf), target, strength, ui,
+                pf.name, sourceDurationMs(pf), target, strength, fastMode, ui,
             )
         }
 
         val trimWeight = 0.35
-        val trimmed = createTrimmedInput(pf, ui) { x -> ui.progress(trimWeight * x) }
+        val trimmed = createTrimmedInput(pf, fastMode, ui) { x -> ui.progress(trimWeight * x) }
             ?: return false
         return try {
             val sub = JobUi(ui.log, ui.stage) { x ->
@@ -1276,7 +1373,7 @@ class MainActivity : AppCompatActivity() {
             }
             processInput(
                 { trimmed.absolutePath }, pf.name, effectiveDurationMs(pf),
-                target, strength, sub,
+                target, strength, fastMode, sub,
             )
         } finally {
             trimmed.delete()
@@ -1289,7 +1386,7 @@ class MainActivity : AppCompatActivity() {
      */
     private fun processInput(
         input: () -> String, name: String, durMs: Long,
-        target: Double, strength: Double, ui: JobUi,
+        target: Double, strength: Double, fastMode: Boolean, ui: JobUi,
     ): Boolean {
         val dur = durMs.coerceAtLeast(1L).toDouble()
         ui.stage("第 1 步 / 共 2 步：扫描响度…")
@@ -1355,17 +1452,20 @@ class MainActivity : AppCompatActivity() {
                     } ?: "${base}_响度未知.mp4"
                 },
             ) { out ->
-                runFFmpeg(
-                    arrayOf(
+                val args = ArrayList<String>()
+                args.addAll(
+                    listOf(
                         "-hide_banner", "-y",
                         "-i", input(),
                         "-map", "0:v?", "-map", "0:a:0",
                         "-c:v", "copy",
                         "-af", filter,
-                        "-c:a", "aac", "-b:a", "192k",
-                        "-f", "mp4",
-                        out,
-                    ),
+                    )
+                )
+                args.addAll(aacArgs(fastMode))
+                args.addAll(listOf("-f", "mp4", out))
+                runFFmpeg(
+                    args.toTypedArray(),
                     onTimeMs = { ms -> ui.progress(0.2 + 0.8 * ms / dur) },
                 )
             }
