@@ -78,6 +78,7 @@ class MainActivity : AppCompatActivity() {
 
     private val picked = mutableListOf<PickedFile>()
     private var busy = false
+    private val settings by lazy { getSharedPreferences("user_settings", MODE_PRIVATE) }
 
     @Volatile
     private var notificationStage = "准备处理…"
@@ -126,11 +127,18 @@ class MainActivity : AppCompatActivity() {
         cbRepair = findViewById(R.id.cbRepair)
         cbConcat = findViewById(R.id.cbConcat)
 
+        sbTarget.progress = settings.getInt("target_progress", 4).coerceIn(0, sbTarget.max)
+        sbStrength.progress = settings.getInt("strength_progress", 35).coerceIn(0, sbStrength.max)
+        tvTarget.text = "目标响度：${targetLufs().toInt()} LUFS"
+        tvStrength.text = "均衡力度：${(strength() * 100).toInt()}%"
+
         sbTarget.setOnSeekBarChangeListener(simpleSeek {
             tvTarget.text = "目标响度：${targetLufs().toInt()} LUFS"
+            settings.edit().putInt("target_progress", sbTarget.progress).apply()
         })
         sbStrength.setOnSeekBarChangeListener(simpleSeek {
             tvStrength.text = "均衡力度：${(strength() * 100).toInt()}%"
+            settings.edit().putInt("strength_progress", sbStrength.progress).apply()
         })
         cbRepair.setOnCheckedChangeListener { _, checked ->
             sbTarget.isEnabled = !checked && !busy
@@ -628,7 +636,10 @@ class MainActivity : AppCompatActivity() {
      * 个别机型输出流不可 seek 导致 mp4 封装失败时，自动回退到"先写缓存再复制"。
      */
     private fun encodeToGallery(
-        outName: String, logFn: (String) -> Unit, encode: (String) -> FFmpegSession,
+        outName: String,
+        logFn: (String) -> Unit,
+        finalName: (() -> String?)? = null,
+        encode: (String) -> FFmpegSession,
     ): Boolean {
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, outName)
@@ -664,6 +675,7 @@ class MainActivity : AppCompatActivity() {
                 return false
             }
             values.clear()
+            finalName?.invoke()?.let { values.put(MediaStore.Video.Media.DISPLAY_NAME, it) }
             values.put(MediaStore.Video.Media.IS_PENDING, 0)
             contentResolver.update(outUri, values, null, null)
             return true
@@ -927,8 +939,18 @@ class MainActivity : AppCompatActivity() {
             val tGen = System.currentTimeMillis()
             val filter = Engine.buildFilter(target, vol, measured) +
                 ",ebur128=metadata=1,ametadata=mode=print:file='$finalPath'"
-            val base = name.substringBeforeLast('.')
-            val done = encodeToGallery("${base}_均衡.mp4", ui.log) { out ->
+            val base = cleanOutputBase(name)
+            var finalLoudness: Double? = null
+            val done = encodeToGallery(
+                outName = "${base}_处理中.mp4",
+                logFn = ui.log,
+                finalName = {
+                    finalLoudness = readFinalLoudness(finalMeta)
+                    finalLoudness?.let {
+                        String.format(java.util.Locale.US, "%s_%.2fLUFS.mp4", base, it)
+                    } ?: "${base}_响度未知.mp4"
+                },
+            ) { out ->
                 runFFmpeg(
                     arrayOf(
                         "-hide_banner", "-y",
@@ -944,7 +966,7 @@ class MainActivity : AppCompatActivity() {
                 )
             }
             if (done) {
-                readFinalLoudness(finalMeta)?.let {
+                finalLoudness?.let {
                     ui.log(String.format(java.util.Locale.US, "  均衡后最终响度：%.2f LUFS", it))
                 }
                 ui.log("  生成用时 ${elapsed(tGen)}")
@@ -953,6 +975,17 @@ class MainActivity : AppCompatActivity() {
         } finally {
             cmdFile.delete()
             finalMeta.delete()
+        }
+    }
+
+    /** 避免重复处理后文件名不断叠加“_均衡”或旧的响度后缀。 */
+    private fun cleanOutputBase(name: String): String {
+        val suffix = Regex("_(?:均衡|[+-]?\\d+(?:\\.\\d+)?LUFS|响度未知)$", RegexOption.IGNORE_CASE)
+        var base = name.substringBeforeLast('.')
+        while (true) {
+            val cleaned = base.replace(suffix, "")
+            if (cleaned == base) return base
+            base = cleaned
         }
     }
 
