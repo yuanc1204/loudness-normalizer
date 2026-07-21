@@ -136,6 +136,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
     private val activeSessionIds = ConcurrentHashMap.newKeySet<Long>()
     private val preciseVideoEncodeLock = java.util.concurrent.Semaphore(1)
     private val durationCache = ConcurrentHashMap<String, Long>()
+    private val fastVideoComposer = FastVideoComposer(appContext)
 
     private class ProcessingCanceledException : RuntimeException()
 
@@ -145,12 +146,13 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         val progress: (Double) -> Unit,
     )
 
-    private class Job(val title: String, val weightMs: Long, val run: (JobUi) -> Boolean)
+    private class Job(val title: String, val weightMs: Long, val run: suspend (JobUi) -> Boolean)
 
     fun cancel() {
         if (!cancelRequested.compareAndSet(false, true)) return
         callbacks.stage("正在取消并清理…")
         activeSessionIds.toList().forEach(FFmpegKit::cancel)
+        fastVideoComposer.cancel()
     }
 
     suspend fun process(request: ProcessingRequest): BatchResult = coroutineScope {
@@ -375,6 +377,55 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         }
     }
 
+    /** 已经生成好的 MP4 直接复制进相册，不再启动一次 ffmpeg 重封装。 */
+    private fun publishPreparedVideo(
+        input: File,
+        outName: String,
+        logFn: (String) -> Unit,
+        finalName: (() -> String?)? = null,
+        onFraction: ((Double) -> Unit)? = null,
+    ): Boolean {
+        val values = ContentValues().apply {
+            put(MediaStore.Video.Media.DISPLAY_NAME, outName)
+            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/响度均衡")
+            put(MediaStore.Video.Media.IS_PENDING, 1)
+        }
+        val outUri = contentResolver.insert(
+            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values
+        )
+        if (outUri == null) {
+            logFn("  失败：无法写入相册")
+            return false
+        }
+        try {
+            val total = input.length().coerceAtLeast(1L).toDouble()
+            var copied = 0L
+            contentResolver.openOutputStream(outUri)!!.buffered().use { output ->
+                input.inputStream().buffered().use { source ->
+                    val buffer = ByteArray(1024 * 1024)
+                    while (true) {
+                        throwIfCancelled()
+                        val count = source.read(buffer)
+                        if (count < 0) break
+                        output.write(buffer, 0, count)
+                        copied += count
+                        onFraction?.invoke((copied / total).coerceIn(0.0, 1.0))
+                    }
+                }
+            }
+            values.clear()
+            finalName?.invoke()?.let { values.put(MediaStore.Video.Media.DISPLAY_NAME, it) }
+            values.put(MediaStore.Video.Media.IS_PENDING, 0)
+            contentResolver.update(outUri, values, null, null)
+            onFraction?.invoke(1.0)
+            return true
+        } catch (e: Exception) {
+            contentResolver.delete(outUri, null, null)
+            throw e
+        }
+    }
+
     private data class CanvasSpec(val width: Int, val height: Int)
 
     private fun buildPreciseClipFilter(
@@ -448,6 +499,164 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
             filters.add("[vcat]format=$pixelFormat[vout]")
         }
         return filters.joinToString(";")
+    }
+
+    /** 只拼接时间线音频；画面可同时交给 Media3 在硬件管线中处理。 */
+    private fun buildConcatAudioFilter(
+        rangesByInput: List<List<ClipRange>>,
+        audioByInput: List<Boolean>,
+        inputOffset: Int,
+        outputLabel: String,
+    ): String {
+        require(rangesByInput.size == audioByInput.size)
+        require(audioByInput.any { it }) { "输入视频没有音轨" }
+        val filters = ArrayList<String>()
+        val concatInputs = StringBuilder()
+        var segment = 0
+        for ((inputIndex, ranges) in rangesByInput.withIndex()) {
+            for (range in ranges) {
+                val start = String.format(java.util.Locale.US, "%.3f", range.startMs / 1000.0)
+                val end = String.format(java.util.Locale.US, "%.3f", range.endMs / 1000.0)
+                if (audioByInput[inputIndex]) {
+                    filters.add(
+                        "[${inputIndex + inputOffset}:a:0]atrim=start=$start:end=$end," +
+                            "asetpts=PTS-STARTPTS,aresample=48000:async=1:first_pts=0," +
+                            "aformat=sample_fmts=fltp:sample_rates=48000:" +
+                            "channel_layouts=stereo[a$segment]"
+                    )
+                } else {
+                    val duration = String.format(
+                        java.util.Locale.US, "%.3f", range.durationMs / 1000.0
+                    )
+                    filters.add(
+                        "anullsrc=r=48000:cl=stereo,atrim=duration=$duration," +
+                            "asetpts=PTS-STARTPTS[a$segment]"
+                    )
+                }
+                concatInputs.append("[a$segment]")
+                segment++
+            }
+        }
+        require(segment > 0) { "没有可保留的音频片段" }
+        if (segment == 1) filters.add("[a0]anull[$outputLabel]")
+        else filters.add("${concatInputs}concat=n=$segment:v=0:a=1[$outputLabel]")
+        return filters.joinToString(";")
+    }
+
+    private fun scanConcatAudio(
+        inputProviders: List<() -> String>,
+        rangesByInput: List<List<ClipRange>>,
+        audioByInput: List<Boolean>,
+        durationMs: Double,
+        onProgress: (Double) -> Unit,
+        logFn: (String) -> Unit,
+    ): List<Engine.Pt>? {
+        val metadataFile = File(cacheDir, "scan_join_${System.nanoTime()}.txt")
+        val metadataPath = metadataFile.absolutePath.replace("\\", "/").replace(":", "\\:")
+        return try {
+            val args = ArrayList<String>()
+            args.addAll(listOf("-hide_banner", "-nostats"))
+            for (provider in inputProviders) args.addAll(listOf("-i", provider()))
+            val filter = buildConcatAudioFilter(
+                rangesByInput, audioByInput, inputOffset = 0, outputLabel = "ajoin"
+            ) + ";[ajoin]ebur128=peak=true:metadata=1," +
+                "ametadata=mode=print:file='$metadataPath'[ascan]"
+            args.addAll(
+                listOf(
+                    "-filter_complex", filter,
+                    "-map", "[ascan]",
+                    "-f", "null", "-",
+                )
+            )
+            val scan = runFFmpeg(
+                args.toTypedArray(),
+                onTimeMs = { ms -> onProgress((ms / durationMs).coerceIn(0.0, 1.0)) },
+            )
+            if (!ReturnCode.isSuccess(scan.returnCode)) {
+                logFn("  失败：无法扫描拼接后的音频")
+                logFn("  " + scan.getAllLogsAsString(2000).lines().takeLast(5).joinToString("\n  "))
+                null
+            } else if (!metadataFile.exists()) {
+                emptyList()
+            } else {
+                Engine.parseMetadata(metadataFile.readText())
+            }
+        } finally {
+            metadataFile.delete()
+        }
+    }
+
+    private fun renderTimelineVideo(
+        inputs: List<File>,
+        rangesByInput: List<List<ClipRange>>,
+        canvas: CanvasSpec,
+        output: File,
+        logFn: (String) -> Unit,
+        onProgress: (Double) -> Unit,
+    ): Boolean {
+        preciseVideoEncodeLock.acquire()
+        val media3Result = try {
+            fastVideoComposer.render(
+                inputs = inputs,
+                rangesByInput = rangesByInput,
+                width = canvas.width,
+                height = canvas.height,
+                output = output,
+                isCancelled = cancelRequested::get,
+                onProgress = onProgress,
+            )
+        } finally {
+            preciseVideoEncodeLock.release()
+        }
+        throwIfCancelled()
+        if (media3Result.success) return true
+        logFn("  失败：系统硬件合成不可用：${media3Result.error ?: "未知原因"}")
+        return false
+    }
+
+    private fun runFinalTimelineMux(
+        video: File,
+        inputProviders: List<() -> String>,
+        rangesByInput: List<List<ClipRange>>,
+        audioByInput: List<Boolean>,
+        audioPostFilter: String?,
+        output: File,
+        fastMode: Boolean,
+        onTimeMs: ((Double) -> Unit)?,
+    ): FFmpegSession {
+        val hasAudio = audioByInput.any { it }
+        val args = ArrayList<String>()
+        args.addAll(listOf("-hide_banner", "-y", "-i", video.absolutePath))
+        if (hasAudio) {
+            for (provider in inputProviders) args.addAll(listOf("-i", provider()))
+            val audioFilter = buildConcatAudioFilter(
+                rangesByInput, audioByInput, inputOffset = 1, outputLabel = "ajoin"
+            ) + ";[ajoin]${audioPostFilter ?: "anull"}[aout]"
+            args.addAll(
+                listOf(
+                    "-filter_complex", audioFilter,
+                    "-map", "0:v:0",
+                    "-map", "[aout]",
+                    "-c:v", "copy",
+                )
+            )
+            args.addAll(aacArgs(fastMode))
+        } else {
+            args.addAll(listOf("-map", "0:v:0", "-c:v", "copy", "-an"))
+        }
+        args.addAll(
+            listOf(
+                "-map_metadata", "-1",
+                "-map_chapters", "-1",
+                "-avoid_negative_ts", "make_zero",
+                "-max_muxing_queue_size", "2048",
+                "-movflags", "+faststart",
+                "-f", "mp4",
+                output.absolutePath,
+            )
+        )
+        output.delete()
+        return runFFmpeg(args.toTypedArray(), onTimeMs = onTimeMs)
     }
 
     private fun aacArgs(fastMode: Boolean): List<String> =
@@ -774,7 +983,208 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         return CanvasSpec(even(displayWidth), even(displayHeight))
     }
 
-    private fun concatOne(
+    /**
+     * 编辑器式导出：音频分析与硬件画面合成并行，画面只编码一次，随后仅编码音频并封装。
+     */
+    private suspend fun processRenderedTimeline(
+        tempCopies: List<File>,
+        files: List<ProcessingInput>,
+        infos: List<VidInfo>,
+        canvas: CanvasSpec,
+        outBase: String,
+        repair: Boolean,
+        target: Double,
+        strength: Double,
+        fastMode: Boolean,
+        totalDuration: Double,
+        copyWeight: Double,
+        ui: JobUi,
+    ): Boolean = coroutineScope {
+        val rangesByInput = files.map(::clipRangesFor)
+        val audioByInput = infos.map { it.audioMime != null }
+        val hasAudio = audioByInput.any { it }
+        if (!repair && !hasAudio) {
+            ui.log("  失败：这些视频都没有音轨，无法进行响度均衡")
+            return@coroutineScope false
+        }
+
+        val video = File(cacheDir, "timeline_video_${System.nanoTime()}.mp4")
+        val finalOutput = File(cacheDir, "timeline_final_${System.nanoTime()}.mp4")
+        val inputProviders = tempCopies.map { file -> ({ file.absolutePath }) }
+        val prepWeight = if (repair) 0.75 else 0.70
+        val renderShare = if (repair) 1.0 else 0.85
+        val progressLock = Any()
+        var renderFraction = 0.0
+        var scanFraction = if (repair) 1.0 else 0.0
+        fun updatePreparation() {
+            val fraction = synchronized(progressLock) {
+                renderShare * renderFraction + (1.0 - renderShare) * scanFraction
+            }
+            ui.progress(copyWeight + prepWeight * fraction)
+        }
+
+        try {
+            ui.stage(
+                if (repair) "快速导出：硬件合成画面…"
+                else "快速导出：并行分析音频与合成画面…"
+            )
+            val renderStarted = System.currentTimeMillis()
+            val renderTask = async {
+                renderTimelineVideo(
+                    inputs = tempCopies,
+                    rangesByInput = rangesByInput,
+                    canvas = canvas,
+                    output = video,
+                    logFn = ui.log,
+                    onProgress = { fraction ->
+                        synchronized(progressLock) {
+                            renderFraction = maxOf(renderFraction, fraction)
+                        }
+                        updatePreparation()
+                    },
+                )
+            }
+            val scanTask = if (!repair) async {
+                val startedAt = System.currentTimeMillis()
+                val result = scanConcatAudio(
+                    inputProviders = inputProviders,
+                    rangesByInput = rangesByInput,
+                    audioByInput = audioByInput,
+                    durationMs = totalDuration,
+                    onProgress = { fraction ->
+                        synchronized(progressLock) {
+                            scanFraction = maxOf(scanFraction, fraction)
+                        }
+                        updatePreparation()
+                    },
+                    logFn = ui.log,
+                )
+                result to elapsed(startedAt)
+            } else null
+
+            val rendered = renderTask.await()
+            val renderElapsed = elapsed(renderStarted)
+            val scanResult = scanTask?.await()
+            val points = scanResult?.first
+            if (!rendered) return@coroutineScope false
+            ui.log("  画面合成用时 $renderElapsed")
+            if (!repair) ui.log("  音频分析用时 ${scanResult?.second}（与画面合成并行）")
+
+            synchronized(progressLock) {
+                renderFraction = 1.0
+                scanFraction = 1.0
+            }
+            updatePreparation()
+            val finalBase = copyWeight + prepWeight
+            val finalWeight = 1.0 - finalBase
+
+            if (repair && !hasAudio) {
+                ui.stage("保存成品…")
+                return@coroutineScope publishPreparedVideo(
+                    video, "$outBase.mp4", ui.log,
+                    onFraction = { fraction -> ui.progress(finalBase + finalWeight * fraction) },
+                )
+            }
+
+            var audioFilter: String? = null
+            var commandFile: File? = null
+            var finalMetadata: File? = null
+            var finalLoudness: Double? = null
+            if (!repair) {
+                if (points.isNullOrEmpty()) {
+                    ui.log("  失败：未取得响度数据")
+                    return@coroutineScope false
+                }
+                val segments = Engine.makeSegments(points, target, strength)
+                val knots = Engine.makeKnots(segments)
+                commandFile = File(cacheDir, "gain_join_${System.nanoTime()}.cmd")
+                val volume = Engine.writeGainCmds(knots, commandFile)
+                val changed = segments.filter { abs(it.g) >= 0.5 }
+                ui.log("  共分 ${segments.size} 段，调整 ${changed.size} 段：")
+                for (segment in changed) {
+                    ui.log(
+                        String.format(
+                            java.util.Locale.US,
+                            "    %.0fs~%.0fs  %+.1f dB",
+                            segment.a,
+                            segment.b,
+                            segment.g,
+                        )
+                    )
+                }
+                val measured = Engine.computeMeasured(points, knots)
+                finalMetadata = File(cacheDir, "final_join_${System.nanoTime()}.txt")
+                val finalPath = finalMetadata.absolutePath
+                    .replace("\\", "/").replace(":", "\\:")
+                audioFilter = Engine.buildFilter(target, volume, measured) +
+                    ",ebur128=metadata=1,ametadata=mode=print:file='$finalPath'"
+            }
+
+            try {
+                ui.stage(
+                    if (repair) "一次封装音频并保存…"
+                    else "一次导出：均衡音频并封装…"
+                )
+                val generatedAt = System.currentTimeMillis()
+                val session = runFinalTimelineMux(
+                    video = video,
+                    inputProviders = inputProviders,
+                    rangesByInput = rangesByInput,
+                    audioByInput = audioByInput,
+                    audioPostFilter = audioFilter,
+                    output = finalOutput,
+                    fastMode = fastMode,
+                    onTimeMs = { ms ->
+                        ui.progress(
+                            finalBase + finalWeight * 0.85 *
+                                (ms / totalDuration).coerceIn(0.0, 1.0)
+                        )
+                    },
+                )
+                if (!ReturnCode.isSuccess(session.returnCode) || !finalOutput.exists()) {
+                    ui.log("  失败：导出成品时出错")
+                    ui.log(
+                        "  " + session.getAllLogsAsString(2000).lines()
+                            .takeLast(6).joinToString("\n  ")
+                    )
+                    return@coroutineScope false
+                }
+
+                val base = cleanOutputBase("$outBase.mp4")
+                val published = publishPreparedVideo(
+                    input = finalOutput,
+                    outName = if (repair) "$outBase.mp4" else "${base}_处理中.mp4",
+                    logFn = ui.log,
+                    finalName = if (repair) null else {
+                        {
+                            finalLoudness = finalMetadata?.let(::readFinalLoudness)
+                            finalLoudness?.let {
+                                String.format(java.util.Locale.US, "%s_%.2fLUFS.mp4", base, it)
+                            } ?: "${base}_响度未知.mp4"
+                        }
+                    },
+                    onFraction = { fraction ->
+                        ui.progress(finalBase + finalWeight * (0.85 + 0.15 * fraction))
+                    },
+                )
+                if (published) {
+                    finalLoudness?.let {
+                        ui.log(String.format(java.util.Locale.US, "  均衡后最终响度：%.2f LUFS", it))
+                    }
+                    ui.log("  一次导出用时 ${elapsed(generatedAt)}")
+                }
+                return@coroutineScope published
+            } finally {
+                commandFile?.delete()
+                finalMetadata?.delete()
+            }
+        } finally {
+            video.delete()
+            finalOutput.delete()
+        }
+    }
+
+    private suspend fun concatOne(
         files: List<ProcessingInput>,
         repair: Boolean,
         target: Double,
@@ -838,51 +1248,20 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
             }
 
             if (needsRender) {
-                val merged = File(cacheDir, "merged_clip_$stamp.mp4")
-                try {
-                    ui.stage(
-                        if (canLosslessConcat) "裁剪并拼接保留片段…"
-                        else "统一画面尺寸并兼容拼接…"
-                    )
-                    val clipWeight = if (repair) 0.75 else 0.30
-                    val session = runPreciseClip(
-                        tempCopies.map { file -> ({ file.absolutePath }) },
-                        files.map(::clipRangesFor),
-                        resolvedInfos.map { it.audioMime != null },
-                        resolvedInfos.maxOf { it.bitrate },
-                        merged,
-                        fastMode,
-                        ui.log,
-                        onTimeMs = { ms ->
-                            ui.progress(copyWeight + clipWeight * ms / totalDuration)
-                        },
-                        canvas = canvas,
-                        normalizeAudio = !canLosslessConcat,
-                    )
-                    if (!ReturnCode.isSuccess(session.returnCode) || !merged.exists()) {
-                        ui.log("  失败：兼容拼接时出错：")
-                        ui.log(
-                            "  " + session.getAllLogsAsString(2000).lines()
-                                .takeLast(6).joinToString("\n  ")
-                        )
-                        return false
-                    }
-                    tempCopies.forEach { it.delete() }
-                    val processedBase = copyWeight + clipWeight
-                    val subUi = JobUi(ui.log, ui.stage) { fraction ->
-                        ui.progress(processedBase + (1.0 - processedBase) * fraction)
-                    }
-                    return if (repair) {
-                        savePreparedVideo(merged, "$outBase.mp4", totalDuration.toLong(), subUi)
-                    } else {
-                        processInput(
-                            { merged.absolutePath }, "$outBase.mp4", totalDuration.toLong(),
-                            target, strength, fastMode, subUi,
-                        )
-                    }
-                } finally {
-                    merged.delete()
-                }
+                return processRenderedTimeline(
+                    tempCopies = tempCopies,
+                    files = files,
+                    infos = resolvedInfos,
+                    canvas = canvas ?: canvasFor(reference),
+                    outBase = outBase,
+                    repair = repair,
+                    target = target,
+                    strength = strength,
+                    fastMode = fastMode,
+                    totalDuration = totalDuration,
+                    copyWeight = copyWeight,
+                    ui = ui,
+                )
             }
 
             listFile.writeText(tempCopies.joinToString("") { "file '${it.absolutePath}'\n" })

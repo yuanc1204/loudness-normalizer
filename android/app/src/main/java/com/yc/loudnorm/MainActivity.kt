@@ -625,11 +625,12 @@ class MainActivity : AppCompatActivity() {
         val singleBytes = picked.filter { !willConcat() || !it.inConcat }.sumOf { sizes[it] ?: 0L }
         if (concatBytes + singleBytes == 0L) return 0L
 
-        // 裁剪过的单视频会先生成一个精确裁剪缓存；拼接在峰值时需容纳输入副本和合并文件。
+        // 裁剪过的单视频会先生成一个精确裁剪缓存；兼容拼接在最终封装时会同时保留
+        // 输入副本、硬件合成画面和待发布成品，按三份源文件大小保守估算。
         val trimmedSingleBytes = picked.filter {
             (!willConcat() || !it.inConcat) && it.clipRanges != null
         }.sumOf { sizes[it] ?: 0L }
-        val estimatedPeak = singleBytes + trimmedSingleBytes + concatBytes * 2
+        val estimatedPeak = singleBytes + trimmedSingleBytes + concatBytes * 3
         return (estimatedPeak * 1.15).toLong() + 100L * 1024 * 1024
     }
 
