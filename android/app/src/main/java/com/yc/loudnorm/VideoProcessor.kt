@@ -590,6 +590,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         inputs: List<File>,
         rangesByInput: List<List<ClipRange>>,
         canvas: CanvasSpec,
+        videoBitrate: Int,
         output: File,
         logFn: (String) -> Unit,
         onProgress: (Double) -> Unit,
@@ -601,6 +602,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
                 rangesByInput = rangesByInput,
                 width = canvas.width,
                 height = canvas.height,
+                videoBitrate = videoBitrate,
                 output = output,
                 isCancelled = cancelRequested::get,
                 onProgress = onProgress,
@@ -984,6 +986,33 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
     }
 
     /**
+     * 按各保留片段的原视频码率加权；素材缩小到画布时按像素比例同步降码率，
+     * 避免硬件编码器使用过高的默认值导致文件无意义膨胀。
+     */
+    private fun timelineVideoBitrate(
+        infos: List<VidInfo>,
+        rangesByInput: List<List<ClipRange>>,
+        canvas: CanvasSpec,
+    ): Int {
+        val canvasPixels = canvas.width.toDouble() * canvas.height
+        var weightedBitrate = 0.0
+        var totalDuration = 0L
+        for ((index, ranges) in rangesByInput.withIndex()) {
+            val info = infos[index]
+            val sourcePixels = (info.width.toDouble() * info.height).coerceAtLeast(1.0)
+            val scaleRatio = (canvasPixels / sourcePixels).coerceAtMost(1.0)
+            val adjustedBitrate = info.bitrate * scaleRatio
+            val duration = ranges.sumOf { it.durationMs }
+            weightedBitrate += adjustedBitrate * duration
+            totalDuration += duration
+        }
+        if (totalDuration <= 0L) return 8_000_000
+        return (weightedBitrate / totalDuration)
+            .toInt()
+            .coerceIn(500_000, 30_000_000)
+    }
+
+    /**
      * 编辑器式导出：音频分析与硬件画面合成并行，画面只编码一次，随后仅编码音频并封装。
      */
     private suspend fun processRenderedTimeline(
@@ -1002,6 +1031,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
     ): Boolean = coroutineScope {
         val rangesByInput = files.map(::clipRangesFor)
         val audioByInput = infos.map { it.audioMime != null }
+        val videoBitrate = timelineVideoBitrate(infos, rangesByInput, canvas)
         val hasAudio = audioByInput.any { it }
         if (!repair && !hasAudio) {
             ui.log("  失败：这些视频都没有音轨，无法进行响度均衡")
@@ -1028,12 +1058,20 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
                 if (repair) "快速导出：硬件合成画面…"
                 else "快速导出：并行分析音频与合成画面…"
             )
+            ui.log(
+                String.format(
+                    java.util.Locale.US,
+                    "  输出视频目标码率：%.1f Mbps（按原素材加权）",
+                    videoBitrate / 1_000_000.0,
+                )
+            )
             val renderStarted = System.currentTimeMillis()
             val renderTask = async {
                 renderTimelineVideo(
                     inputs = tempCopies,
                     rangesByInput = rangesByInput,
                     canvas = canvas,
+                    videoBitrate = videoBitrate,
                     output = video,
                     logFn = ui.log,
                     onProgress = { fraction ->

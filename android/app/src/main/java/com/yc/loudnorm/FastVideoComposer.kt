@@ -11,6 +11,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
 import androidx.media3.effect.Presentation
 import androidx.media3.transformer.Composition
+import androidx.media3.transformer.DefaultEncoderFactory
 import androidx.media3.transformer.EditedMediaItem
 import androidx.media3.transformer.EditedMediaItemSequence
 import androidx.media3.transformer.Effects
@@ -18,6 +19,7 @@ import androidx.media3.transformer.ExportException
 import androidx.media3.transformer.ExportResult
 import androidx.media3.transformer.ProgressHolder
 import androidx.media3.transformer.Transformer
+import androidx.media3.transformer.VideoEncoderSettings
 import java.io.File
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -48,6 +50,7 @@ class FastVideoComposer(context: Context) {
         rangesByInput: List<List<ClipRange>>,
         width: Int,
         height: Int,
+        videoBitrate: Int,
         output: File,
         isCancelled: () -> Boolean,
         onProgress: (Double) -> Unit,
@@ -94,9 +97,17 @@ class FastVideoComposer(context: Context) {
                 val sequence = EditedMediaItemSequence(clips)
                 val composition = Composition.Builder(sequence).build()
 
+                val encoderSettings = VideoEncoderSettings.Builder()
+                    .setBitrate(videoBitrate.coerceIn(500_000, 30_000_000))
+                    .build()
+                val encoderFactory = DefaultEncoderFactory.Builder(appContext)
+                    .setRequestedVideoEncoderSettings(encoderSettings)
+                    .build()
+
                 lateinit var transformer: Transformer
                 transformer = Transformer.Builder(appContext)
                     .setVideoMimeType(MimeTypes.VIDEO_H264)
+                    .setEncoderFactory(encoderFactory)
                     .addListener(object : Transformer.Listener {
                         override fun onCompleted(
                             composition: Composition,
