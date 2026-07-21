@@ -18,6 +18,10 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 /** 持有整批视频任务，让切换 App、返回桌面或锁屏后仍能可靠处理和通知。 */
@@ -29,43 +33,57 @@ class ProcessingService : Service() {
         val cancelled: Boolean = false,
     )
 
+    data class ProcessingState(
+        val runId: Long = 0L,
+        val running: Boolean = false,
+        val cancelRequested: Boolean = false,
+        val progress: Int = 0,
+        val stage: String = "",
+        val log: String = "",
+        val result: TaskResult? = null,
+    )
+
     companion object {
         private const val CHANNEL_ID = "video_processing"
         private const val COMPLETE_CHANNEL_ID = "video_processing_complete_v1"
         private const val NOTIFICATION_ID = 1001
         private const val ACTION_START = "com.yc.loudnorm.START"
         private const val ACTION_CANCEL = "com.yc.loudnorm.CANCEL"
+        private const val EXTRA_REQUEST = "processing_request"
         private const val UPDATE_INTERVAL_MS = 1000L
 
-        private data class PendingWork(
-            val task: suspend CoroutineScope.() -> TaskResult,
-            val cancelAction: () -> Unit,
-        )
-
-        private val taskLock = Any()
-        private var pendingWork: PendingWork? = null
+        private val mutableState = MutableStateFlow(ProcessingState())
+        val state: StateFlow<ProcessingState> = mutableState.asStateFlow()
 
         @Volatile
         private var instance: ProcessingService? = null
 
         @Volatile
+        private var cancelBeforeStart = false
+
+        @Volatile
         var isRunning = false
             private set
 
-        fun start(
-            context: Context,
-            cancelAction: () -> Unit,
-            task: suspend CoroutineScope.() -> TaskResult,
-        ) {
-            synchronized(taskLock) {
-                check(pendingWork == null && !isRunning) { "已有视频处理任务正在运行" }
-                pendingWork = PendingWork(task, cancelAction)
-            }
+        /** 只传递可序列化任务数据；服务自行创建处理器，不保存 Activity 或界面回调。 */
+        fun start(context: Context, request: ProcessingRequest) {
+            check(!mutableState.value.running && !isRunning) { "已有视频处理任务正在运行" }
+            cancelBeforeStart = false
+            mutableState.value = ProcessingState(
+                runId = request.runId,
+                running = true,
+                stage = "准备处理…",
+            )
             try {
-                val intent = Intent(context, ProcessingService::class.java).setAction(ACTION_START)
+                val intent = Intent(context, ProcessingService::class.java)
+                    .setAction(ACTION_START)
+                    .putExtra(EXTRA_REQUEST, request.toJson())
                 ContextCompat.startForegroundService(context, intent)
             } catch (e: Exception) {
-                synchronized(taskLock) { pendingWork = null }
+                mutableState.value = ProcessingState(
+                    runId = request.runId,
+                    result = TaskResult(false, "任务启动失败：${e.message ?: "未知错误"}"),
+                )
                 throw e
             }
         }
@@ -74,24 +92,30 @@ class ProcessingService : Service() {
             val running = instance
             if (running != null && isRunning) {
                 running.requestCancel()
-                return
+            } else if (mutableState.value.running) {
+                cancelBeforeStart = true
+                mutableState.update {
+                    it.copy(cancelRequested = true, stage = "正在取消并清理…")
+                }
             }
-            synchronized(taskLock) { pendingWork?.cancelAction }?.invoke()
         }
 
-        fun update(progress: Int, text: String) {
-            instance?.enqueueProgress(progress, text)
+        fun acknowledgeResult(runId: Long) {
+            mutableState.update { current ->
+                if (!current.running && current.runId == runId) ProcessingState() else current
+            }
         }
     }
 
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val mainHandler = Handler(Looper.getMainLooper())
     private var wakeLock: PowerManager.WakeLock? = null
+    private var processor: VideoProcessor? = null
+    private var currentRunId = 0L
     private var lastNotificationAt = 0L
     private var pendingProgress = 0
     private var pendingText = "准备处理…"
     private var updateScheduled = false
-    @Volatile private var cancelAction: (() -> Unit)? = null
 
     private val flushProgress = Runnable {
         updateScheduled = false
@@ -128,6 +152,8 @@ class ProcessingService : Service() {
         }
         if (intent?.action != ACTION_START || isRunning) return START_NOT_STICKY
 
+        val request = ProcessingRequest.fromJson(intent.getStringExtra(EXTRA_REQUEST))
+        currentRunId = request?.runId ?: mutableState.value.runId
         isRunning = true
         wakeLock = getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Loudnorm:Processing")
@@ -137,18 +163,37 @@ class ProcessingService : Service() {
             }
         startForeground(NOTIFICATION_ID, buildProgressNotification(0, "准备处理…"))
 
-        val work = synchronized(taskLock) {
-            pendingWork.also { pendingWork = null }
-        }
-        if (work == null) {
-            complete(TaskResult(false, "任务启动失败"))
+        if (request == null || request.files.isEmpty()) {
+            complete(TaskResult(false, "任务数据无效"))
             return START_NOT_STICKY
         }
-        cancelAction = work.cancelAction
 
+        processor = VideoProcessor(applicationContext, object : ProcessingCallbacks {
+            override fun log(text: String) {
+                mutableState.update { current ->
+                    if (current.runId != currentRunId) current
+                    else current.copy(log = if (current.log.isEmpty()) text else "${current.log}\n$text")
+                }
+            }
+
+            override fun stage(text: String) {
+                mutableState.update { current ->
+                    if (current.runId == currentRunId) current.copy(stage = text) else current
+                }
+                enqueueProgress(mutableState.value.progress, text)
+            }
+
+            override fun progress(percent: Int) {
+                enqueueProgress(percent, mutableState.value.stage.ifBlank { "处理中…" })
+            }
+        })
+
+        if (cancelBeforeStart || mutableState.value.cancelRequested) processor?.cancel()
         serviceScope.launch {
             val result = try {
-                work.task(this)
+                processor!!.process(request).let {
+                    TaskResult(it.success, it.notificationText, it.cancelled)
+                }
             } catch (e: Exception) {
                 TaskResult(false, "处理异常：${e.message ?: "未知错误"}")
             }
@@ -159,9 +204,13 @@ class ProcessingService : Service() {
 
     private fun requestCancel() {
         if (!isRunning) return
-        pendingText = "正在取消并清理…"
-        cancelAction?.invoke()
-        enqueueProgress(pendingProgress, pendingText)
+        mutableState.update { current ->
+            if (current.runId == currentRunId) {
+                current.copy(cancelRequested = true, stage = "正在取消并清理…")
+            } else current
+        }
+        processor?.cancel()
+        enqueueProgress(mutableState.value.progress, "正在取消并清理…")
     }
 
     /** 合并高频进度，只向系统通知栏每秒提交一次最新值，避免系统丢弃更新。 */
@@ -170,6 +219,11 @@ class ProcessingService : Service() {
             if (!isRunning) return@post
             pendingProgress = maxOf(pendingProgress, progress.coerceIn(0, 100))
             pendingText = text
+            mutableState.update { current ->
+                if (current.runId == currentRunId) {
+                    current.copy(progress = maxOf(current.progress, pendingProgress), stage = text)
+                } else current
+            }
             val elapsed = SystemClock.elapsedRealtime() - lastNotificationAt
             if (elapsed >= UPDATE_INTERVAL_MS) {
                 mainHandler.removeCallbacks(flushProgress)
@@ -184,14 +238,19 @@ class ProcessingService : Service() {
     private fun complete(result: TaskResult) {
         if (!isRunning) return
         isRunning = false
-        cancelAction = null
+        processor = null
+        cancelBeforeStart = false
         mainHandler.removeCallbacks(flushProgress)
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         stopForeground(STOP_FOREGROUND_REMOVE)
+        mutableState.update { current ->
+            if (current.runId == currentRunId) {
+                current.copy(running = false, cancelRequested = false, result = result)
+            } else current
+        }
 
         if (!result.cancelled) {
-            // 每批使用不同 ID，确保系统把它当作新通知而非更新上一次完成通知。
             val completionId = (System.currentTimeMillis() and 0x7fffffff).toInt()
             getSystemService(NotificationManager::class.java).notify(
                 completionId,
@@ -248,8 +307,8 @@ class ProcessingService : Service() {
 
     override fun onDestroy() {
         mainHandler.removeCallbacks(flushProgress)
-        if (isRunning) cancelAction?.invoke()
-        cancelAction = null
+        if (isRunning) processor?.cancel()
+        processor = null
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
         serviceScope.cancel()

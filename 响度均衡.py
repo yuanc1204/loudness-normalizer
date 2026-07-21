@@ -290,18 +290,31 @@ def process(path: Path, out_dir: Path, target: float, strength: float,
         lines.append(f"  分段调整后响度：{measured['input_i']} LUFS，波动范围：{measured['input_lra']} LU")
 
         out_path = claim_out_path(path, out_dir, claimed, name_lock)
-        r = run([
-            "ffmpeg", "-hide_banner", "-nostats", "-y", "-i", str(path),
-            "-map", "0:v?", "-map", "0:a:0",
-            "-c:v", "copy",
-            "-af", build_filter(target, vol, measured),
-            "-c:a", "aac", "-b:a", "192k",
-            str(out_path),
-        ])
-    if r.returncode != 0 or not out_path.exists():
-        tail = "\n    ".join(r.stderr.strip().splitlines()[-5:])
-        lines.append(f"  失败：ffmpeg 处理出错：\n    {tail}")
-        return False, "\n".join(lines)
+        # 不直接写最终文件名：ffmpeg 中途失败时可能留下一个能看到但无法播放的半成品。
+        # 临时文件放在同一目录，成功后用原子替换完成落盘；任何失败都会进入 finally 清理。
+        with tempfile.NamedTemporaryFile(
+                prefix=f".{out_path.stem}_", suffix=f".partial{out_path.suffix}",
+                dir=out_dir, delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        try:
+            r = run([
+                "ffmpeg", "-hide_banner", "-nostats", "-y", "-i", str(path),
+                "-map", "0:v?", "-map", "0:a:0",
+                "-c:v", "copy",
+                "-af", build_filter(target, vol, measured),
+                "-c:a", "aac", "-b:a", "192k",
+                str(tmp_path),
+            ])
+            if r.returncode != 0 or not tmp_path.exists() or tmp_path.stat().st_size == 0:
+                tail = "\n    ".join(r.stderr.strip().splitlines()[-5:])
+                lines.append(f"  失败：ffmpeg 处理出错：\n    {tail}")
+                return False, "\n".join(lines)
+            tmp_path.replace(out_path)
+        except OSError as e:
+            lines.append(f"  失败：无法保存成品：{e}")
+            return False, "\n".join(lines)
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
     lines.append(f"  完成 → {out_path}")
     return True, "\n".join(lines)
