@@ -81,23 +81,32 @@ def gated_loudness(m_vals: list[float]) -> float:
     return power_mean_db(vals2 or vals)
 
 
-def scan_timeline(audio_src: Path) -> list[tuple[float, float, float]]:
-    """扫描全片响度时间线，返回 [(时间, 瞬时响度M, 短时响度S), ...]，约每 0.1s 一个点。"""
+def scan_timeline(audio_src: Path) -> list[tuple[float, float, float, float]]:
+    """扫描全片响度时间线，返回 [(时间, 瞬时响度M, 短时响度S, 真峰值TP), ...]，约每 0.1s 一个点。"""
     r = run([
         "ffmpeg", "-hide_banner", "-nostats", "-i", str(audio_src),
-        "-map", "0:a:0", "-af", "ebur128", "-f", "null", "-",
+        "-map", "0:a:0", "-af", "ebur128=peak=true", "-f", "null", "-",
     ])
     pts = []
-    for m in re.finditer(
-            r"t:\s*([\d.]+)\s+TARGET.*?M:\s*(-?[\d.]+|nan)\s+S:\s*(-?[\d.]+|nan)", r.stderr):
+    for line in r.stderr.splitlines():
+        m = re.search(r"t:\s*([\d.]+)\s+TARGET.*?M:\s*(-?[\d.]+|nan)\s+S:\s*(-?[\d.]+|nan)", line)
+        if not m:
+            continue
         t = float(m.group(1))
         mm = -120.0 if m.group(2) == "nan" else float(m.group(2))
         ss = -120.0 if m.group(3) == "nan" else float(m.group(3))
-        pts.append((t, mm, ss))
+
+        tp = -120.0
+        m_ftpk = re.search(r"FTPK:\s*([-\d.\s]+?)(?:TPK:|$)", line)
+        if m_ftpk:
+            peaks = [float(x) for x in m_ftpk.group(1).split() if x != "nan"]
+            if peaks:
+                tp = max(peaks)
+        pts.append((t, mm, ss, tp))
     return pts
 
 
-def make_segments(pts: list[tuple[float, float, float]], target: float,
+def make_segments(pts: list[tuple[float, float, float, float]], target: float,
                   strength: float) -> list[tuple[float, float, float]]:
     """按响度水平分段，返回 [(起点, 终点, 增益dB), ...]。
 
@@ -110,7 +119,7 @@ def make_segments(pts: list[tuple[float, float, float]], target: float,
     seg_start_i = 0
     dev_start = None  # 偏离开始的下标
     cur = None        # 本段参考响度：偏离期间冻结，否则每 1s 用最近 30s 窗口重算
-    for i, (t, _, s) in enumerate(pts):
+    for i, (t, _, s, _) in enumerate(pts):
         if t - pts[seg_start_i][0] < SEG_MIN_LEN:
             continue
         if dev_start is None and (cur is None or i % 10 == 0):
@@ -162,14 +171,7 @@ def make_segments(pts: list[tuple[float, float, float]], target: float,
     return merged
 
 
-def write_gain_cmds(segs: list[tuple[float, float, float]], cmd_path: Path) -> str:
-    """把分段增益写成 asendcmd 命令文件，返回对应的滤镜串。
-
-    ffmpeg 表达式解析器有约 100 个运算符的硬上限，长视频段数多时表达式必炸；
-    sendcmd 命令文件没有长度限制。段内增益恒定，边界处 SEG_RAMP 秒内
-    每 0.05s 一步渐变（步长 ≤1.2dB，且边界都吸附在停顿处，听不出台阶）。
-    """
-    # 折线节点：每个边界前后各一个点，段内平直
+def make_knots(segs: list[tuple[float, float, float]]) -> list[tuple[float, float]]:
     knots: list[tuple[float, float]] = []
     for i, (a, b, g) in enumerate(segs):
         if i == 0:
@@ -180,6 +182,71 @@ def write_gain_cmds(segs: list[tuple[float, float, float]], cmd_path: Path) -> s
             knots.append((b - SEG_RAMP / 2, g))
         else:
             knots.append((b, g))
+    return knots
+
+
+def gain_at(knots: list[tuple[float, float]], t: float) -> float:
+    if t <= knots[0][0]:
+        return knots[0][1]
+    for j in range(len(knots) - 1):
+        t0, g0 = knots[j]
+        t1, g1 = knots[j + 1]
+        if t <= t1:
+            return g0 if t1 - t0 <= 0 else g0 + (g1 - g0) * (t - t0) / (t1 - t0)
+    return knots[-1][1]
+
+
+def compute_measured(pts: list[tuple[float, float, float, float]],
+                     segs: list[tuple[float, float, float]]) -> dict:
+    """根据扫描 pts 数据与分段增益在内存中直接算 loudnorm 所需的测量参数，免跑第二遍 FFmpeg Pass。"""
+    if not pts or not segs:
+        return {"input_i": "-16.00", "input_lra": "7.00", "input_tp": "-1.50", "input_thresh": "-26.00"}
+    knots = make_knots(segs)
+    gains = [gain_at(knots, p[0]) for p in pts]
+
+    i_vals = [p[1] + g for p, g in zip(pts, gains)]
+    i_loud = max(-99.0, min(0.0, gated_loudness(i_vals)))
+
+    s_shifts = [p[2] + g for p, g in zip(pts, gains) if p[2] > -110]
+    v = [s for s in s_shifts if s > -70]
+    if len(v) < 2:
+        lra = 0.0
+    else:
+        gate = power_mean_db(v) - 20
+        kept = sorted([s for s in v if s >= gate])
+        if len(kept) < 2:
+            lra = 0.0
+        else:
+            def pct(p: float) -> float:
+                x = p * (len(kept) - 1)
+                i0 = int(x)
+                if i0 + 1 >= len(kept):
+                    return kept[i0]
+                return kept[i0] + (kept[i0 + 1] - kept[i0]) * (x - i0)
+            lra = pct(0.95) - pct(0.10)
+    lra_c = max(0.0, min(99.0, lra))
+
+    tp_vals = [p[3] + g for p, g in zip(pts, gains)]
+    max_tp = max(tp_vals) if tp_vals else -120.0
+    tp_c = max(-99.0, min(-1.0, max_tp))
+
+    thresh = max(-99.0, min(0.0, i_loud - 10.0))
+    return {
+        "input_i": f"{i_loud:.2f}",
+        "input_lra": f"{lra_c:.2f}",
+        "input_tp": f"{tp_c:.2f}",
+        "input_thresh": f"{thresh:.2f}"
+    }
+
+
+def write_gain_cmds(segs: list[tuple[float, float, float]], cmd_path: Path) -> str:
+    """把分段增益写成 asendcmd 命令文件，返回对应的滤镜串。
+
+    ffmpeg 表达式解析器有约 100 个运算符的硬上限，长视频段数多时表达式必炸；
+    sendcmd 命令文件没有长度限制。段内增益恒定，边界处 SEG_RAMP 秒内
+    每 0.05s 一步渐变（步长 ≤1.2dB，且边界都吸附在停顿处，听不出台阶）。
+    """
+    knots = make_knots(segs)
 
     def lin(db: float) -> str:
         return f"{10 ** (db / 20):.6f}"
@@ -214,22 +281,6 @@ def build_filter(target: float, vol: str, measured: dict | None = None) -> str:
     else:
         loudnorm = f"loudnorm=I={target}:LRA={TARGET_LRA}:TP={TRUE_PEAK}:print_format=json"
     return ",".join((vol, SEG_SAFETY, loudnorm))
-
-
-def measure(path: Path, target: float, vol: str) -> tuple[dict | None, str]:
-    """第一遍：跑完整滤镜链测量响度，解析 loudnorm 输出的 JSON。失败时返回 (None, 错误摘要)。"""
-    r = run([
-        "ffmpeg", "-hide_banner", "-nostats", "-i", str(path),
-        "-map", "0:a:0", "-af", build_filter(target, vol),
-        "-f", "null", "-",
-    ])
-    # loudnorm 的 JSON 打印在 stderr 末尾
-    m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", r.stderr, re.DOTALL)
-    if not m:
-        tail = "\n    ".join(
-            ln for ln in r.stderr.strip().splitlines()[-5:] if len(ln) < 300)
-        return None, tail
-    return json.loads(m.group(0)), ""
 
 
 PRINT_LOCK = threading.Lock()
@@ -283,30 +334,46 @@ def process(path: Path, out_dir: Path, target: float, strength: float,
         if row:
             lines.append("    " + "   ".join(row))
 
-        measured, err = measure(path, target, vol)
-        if measured is None:
-            lines.append(f"  失败：无法分析响度：\n    {err}")
-            return False, "\n".join(lines)
-        lines.append(f"  分段调整后响度：{measured['input_i']} LUFS，波动范围：{measured['input_lra']} LU")
+        # 内存高性能推算响度参数，直接省去原本全长第二遍 FFmpeg 测量 pass
+        measured = compute_measured(pts, segs)
+        lines.append(f"  分段调整推算响度：{measured['input_i']} LUFS，波动范围：{measured['input_lra']} LU")
 
         out_path = claim_out_path(path, out_dir, claimed, name_lock)
-        # 不直接写最终文件名：ffmpeg 中途失败时可能留下一个能看到但无法播放的半成品。
-        # 临时文件放在同一目录，成功后用原子替换完成落盘；任何失败都会进入 finally 清理。
         with tempfile.NamedTemporaryFile(
                 prefix=f".{out_path.stem}_", suffix=f".partial{out_path.suffix}",
                 dir=out_dir, delete=False) as tmp:
             tmp_path = Path(tmp.name)
         try:
-            r = run([
+            cmd = [
                 "ffmpeg", "-hide_banner", "-nostats", "-y", "-i", str(path),
                 "-map", "0:v?", "-map", "0:a:0",
                 "-c:v", "copy",
                 "-af", build_filter(target, vol, measured),
                 "-c:a", "aac", "-b:a", "192k",
                 str(tmp_path),
-            ])
-            if r.returncode != 0 or not tmp_path.exists() or tmp_path.stat().st_size == 0:
-                tail = "\n    ".join(r.stderr.strip().splitlines()[-5:])
+            ]
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8", errors="replace", cwd=SCRIPT_DIR
+            )
+            total_dur = pts[-1][0] if pts else 1.0
+            last_pct = -10
+            stderr_lines = []
+            if proc.stderr:
+                for line in proc.stderr:
+                    stderr_lines.append(line)
+                    m_time = re.search(r"time=\s*(\d+):(\d+):([\d.]+)", line)
+                    if m_time and total_dur > 0:
+                        cur_s = int(m_time.group(1)) * 3600 + int(m_time.group(2)) * 60 + float(m_time.group(3))
+                        pct = min(100, int(cur_s / total_dur * 100))
+                        m_spd = re.search(r"speed=\s*([\d.e+]+)x", line)
+                        spd = m_spd.group(1) + "x" if m_spd else ""
+                        if pct >= last_pct + 25:
+                            last_pct = pct
+                            announce(f"  进度：{path.name} → {pct}% ({spd})".strip())
+            proc.wait()
+            if proc.returncode != 0 or not tmp_path.exists() or tmp_path.stat().st_size == 0:
+                tail = "\n    ".join(ln.strip() for ln in stderr_lines[-5:] if ln.strip())
                 lines.append(f"  失败：ffmpeg 处理出错：\n    {tail}")
                 return False, "\n".join(lines)
             tmp_path.replace(out_path)
@@ -341,12 +408,14 @@ def collect_videos(args_paths: list[str], script_dir: Path) -> list[Path]:
 
 
 def main():
+    import os
     parser = argparse.ArgumentParser(description="视频音量均衡：按段提升小声部分，大声段和段内动态保持自然。")
     parser.add_argument("paths", nargs="*", help="视频文件或文件夹，不填则处理脚本所在文件夹")
     parser.add_argument("--target", type=float, default=-16.0, help="目标响度 LUFS（默认 -16）")
     parser.add_argument("--strength", type=float, default=0.85,
                         help="均衡强度 0~1（默认 0.85，1=每段完全拉到目标响度）")
-    parser.add_argument("--jobs", type=int, default=3, help="同时处理几个视频（默认 3）")
+    default_jobs = max(1, min(4, os.cpu_count() or 3))
+    parser.add_argument("--jobs", type=int, default=default_jobs, help=f"同时处理几个视频（默认 {default_jobs}）")
     args = parser.parse_args()
 
     check_ffmpeg()
@@ -380,3 +449,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
