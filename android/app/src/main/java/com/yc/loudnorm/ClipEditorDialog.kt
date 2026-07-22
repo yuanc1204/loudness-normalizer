@@ -207,8 +207,6 @@ fun showClipEditorDialog(
     var pendingFrameRequest: Runnable? = null
     var pendingFramePositionMs: Long? = null
     var frameInFlight = false
-    var lastPlaybackFrameMs = -PREVIEW_FRAME_INTERVAL_MS
-    var preferSystemFrameExtractor = false
     var systemFrameExtractor: MediaMetadataRetriever? = null
 
     /**
@@ -288,16 +286,17 @@ fun showClipEditorDialog(
         }
     }
 
-    fun startNextFrameRequest(gen: Int, isPlayback: Boolean) {
+    fun startNextFrameRequest() {
         if (frameClosed.get() || frameInFlight) return
         val requestedAt = pendingFramePositionMs ?: return
         pendingFramePositionMs = null
+        val generation = frameGeneration.get()
         frameInFlight = true
         frameExecutor.execute {
             val bitmap = loadSystemFrame(requestedAt) ?: loadFfmpegFrame(requestedAt)
             handler.post {
                 frameInFlight = false
-                if (frameClosed.get() || (!isPlayback && gen != frameGeneration.get())) {
+                if (frameClosed.get() || generation != frameGeneration.get()) {
                     bitmap?.recycle()
                 } else if (bitmap == null) {
                     if (displayedFrame == null) {
@@ -313,20 +312,17 @@ fun showClipEditorDialog(
                     if (previous !== bitmap) previous?.recycle()
                 }
                 if (!frameClosed.get() && pendingFramePositionMs != null) {
-                    startNextFrameRequest(frameGeneration.get(), isPlayback)
+                    startNextFrameRequest()
                 }
             }
         }
     }
 
-    fun requestStillFrame(positionMs: Long, isPlayback: Boolean = false) {
+    fun requestStillFrame(positionMs: Long) {
         val requestedAt = if (durationMs > 40L) {
             positionMs.coerceIn(0L, durationMs - 40L)
         } else 0L
-        if (!isPlayback) {
-            frameGeneration.incrementAndGet()
-        }
-        val gen = frameGeneration.get()
+        frameGeneration.incrementAndGet()
         pendingFramePositionMs = requestedAt
         pendingFrameRequest?.let { handler.removeCallbacks(it) }
         if (displayedFrame == null) {
@@ -334,10 +330,10 @@ fun showClipEditorDialog(
             previewStatus.visibility = View.VISIBLE
         }
         val request = Runnable {
-            if (!frameClosed.get()) startNextFrameRequest(gen, isPlayback)
+            if (!frameClosed.get()) startNextFrameRequest()
         }
         pendingFrameRequest = request
-        handler.postDelayed(request, if (isPlayback) 0L else 20L)
+        handler.postDelayed(request, 20L)
     }
 
     fun findRangeAt(positionMs: Long): Int {
@@ -357,7 +353,7 @@ fun showClipEditorDialog(
         currentMs = positionMs.coerceIn(0L, durationMs)
         selectedIndex = findRangeAt(currentMs)
         if (videoReady) video.seekTo(currentMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
-        if (!video.isPlaying) requestStillFrame(currentMs, isPlayback = false)
+        if (!video.isPlaying) requestStillFrame(currentMs)
     }
 
     fun refreshUi() {
@@ -411,13 +407,6 @@ fun showClipEditorDialog(
                     video.seekTo(currentMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
                 }
             }
-            if (!frameInFlight && pendingFramePositionMs == null &&
-                (currentMs < lastPlaybackFrameMs ||
-                    currentMs - lastPlaybackFrameMs >= 100L)
-            ) {
-                lastPlaybackFrameMs = currentMs
-                requestStillFrame(currentMs, isPlayback = true)
-            }
             refreshUi()
             if (video.isPlaying) handler.postDelayed(this, 80L)
         }
@@ -443,7 +432,7 @@ fun showClipEditorDialog(
             video.pause()
             handler.removeCallbacks(updater)
             stillFrame.visibility = View.VISIBLE
-            requestStillFrame(currentMs, isPlayback = false)
+            requestStillFrame(currentMs)
         } else {
             val currentRange = ranges.getOrNull(findRangeAt(currentMs))
             val start = when {
@@ -455,13 +444,15 @@ fun showClipEditorDialog(
                 else -> currentMs
             }
             seekPreview(start)
+            // 拖动时的静态预览图位于 VideoView 上层。开始播放前必须让它失效并隐藏，
+            // 否则底层视频虽然在正常播放，用户看到的仍会是拖动结束时的那一帧。
+            frameGeneration.incrementAndGet()
+            pendingFramePositionMs = null
+            pendingFrameRequest?.let { handler.removeCallbacks(it) }
+            pendingFrameRequest = null
             video.start()
-            stillFrame.visibility = View.VISIBLE
-            if (displayedFrame == null) {
-                previewStatus.text = "正在生成预览…"
-                previewStatus.visibility = View.VISIBLE
-            }
-            lastPlaybackFrameMs = start - PREVIEW_FRAME_INTERVAL_MS
+            stillFrame.visibility = View.GONE
+            previewStatus.visibility = View.GONE
             handler.removeCallbacks(updater)
             handler.post(updater)
         }
@@ -589,7 +580,6 @@ fun showClipEditorDialog(
 }
 
 private const val MIN_CLIP_PART_MS = 250L
-private const val PREVIEW_FRAME_INTERVAL_MS = 400L
 private const val PREVIEW_MAX_DIMENSION = 720
 
 private fun formatClipTime(ms: Long): String {
