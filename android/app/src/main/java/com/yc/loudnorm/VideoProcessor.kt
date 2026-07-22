@@ -6,6 +6,7 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
+import android.os.Environment
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import com.antonkarpenko.ffmpegkit.FFmpegKit
@@ -329,12 +330,72 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         return if (seconds >= 60L) "${seconds / 60L} 分 ${seconds % 60L} 秒" else "$seconds 秒"
     }
 
+    @Synchronized
+    private fun reserveHiddenOutputFile(name: String): File {
+        val directory = File(
+            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES),
+            ".响度均衡",
+        )
+        if (!directory.exists() && !directory.mkdirs()) {
+            throw IllegalStateException("无法创建 Movies/.响度均衡，请检查所有文件访问权限")
+        }
+        val cleanName = name.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+        val base = cleanName.substringBeforeLast('.', cleanName)
+        val extension = cleanName.substringAfterLast('.', "")
+        var candidate = File(directory, cleanName)
+        var number = 1
+        while (!candidate.createNewFile()) {
+            val suffix = if (extension.isEmpty()) "" else ".$extension"
+            candidate = File(directory, "${base}_$number$suffix")
+            number++
+        }
+        return candidate
+    }
+
+    @Synchronized
+    private fun renameHiddenOutputFile(source: File, name: String): File {
+        val target = reserveHiddenOutputFile(name)
+        if (!target.delete() || !source.renameTo(target)) {
+            target.delete()
+            throw IllegalStateException("无法写入最终文件名")
+        }
+        return target
+    }
+
+    private fun encodeToHiddenFolder(
+        outName: String,
+        logFn: (String) -> Unit,
+        finalName: (() -> String?)?,
+        encode: (String) -> FFmpegSession,
+    ): Boolean {
+        var output = reserveHiddenOutputFile(outName)
+        try {
+            val session = encode(output.absolutePath)
+            if (!ReturnCode.isSuccess(session.returnCode)) {
+                logFn("  失败：ffmpeg 处理出错：")
+                logFn("  " + session.getAllLogsAsString(2000).lines().takeLast(5).joinToString("\n  "))
+                output.delete()
+                return false
+            }
+            finalName?.invoke()?.let { name ->
+                output = renameHiddenOutputFile(output, name)
+            }
+            return true
+        } catch (e: Exception) {
+            output.delete()
+            throw e
+        }
+    }
+
     private fun encodeToGallery(
         outName: String,
         logFn: (String) -> Unit,
         finalName: (() -> String?)? = null,
         encode: (String) -> FFmpegSession,
     ): Boolean {
+        if (outputFolderName.startsWith('.')) {
+            return encodeToHiddenFolder(outName, logFn, finalName, encode)
+        }
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, outName)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
@@ -390,6 +451,34 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         finalName: (() -> String?)? = null,
         onFraction: ((Double) -> Unit)? = null,
     ): Boolean {
+        if (outputFolderName.startsWith('.')) {
+            var output = reserveHiddenOutputFile(outName)
+            try {
+                val total = input.length().coerceAtLeast(1L).toDouble()
+                var copied = 0L
+                output.outputStream().buffered().use { target ->
+                    input.inputStream().buffered().use { source ->
+                        val buffer = ByteArray(1024 * 1024)
+                        while (true) {
+                            throwIfCancelled()
+                            val count = source.read(buffer)
+                            if (count < 0) break
+                            target.write(buffer, 0, count)
+                            copied += count
+                            onFraction?.invoke((copied / total).coerceIn(0.0, 1.0))
+                        }
+                    }
+                }
+                finalName?.invoke()?.let { name ->
+                    output = renameHiddenOutputFile(output, name)
+                }
+                onFraction?.invoke(1.0)
+                return true
+            } catch (e: Exception) {
+                output.delete()
+                throw e
+            }
+        }
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, outName)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")

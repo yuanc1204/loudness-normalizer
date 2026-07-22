@@ -10,8 +10,10 @@ import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.os.StatFs
 import android.provider.OpenableColumns
+import android.provider.Settings
 import android.text.TextUtils
 import android.util.Size
 import android.view.Gravity
@@ -101,6 +103,15 @@ class MainActivity : AppCompatActivity() {
     private val requestNotificationPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
+    private val requestAllFilesAccess =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()) {
+                startProcessing()
+            } else {
+                showHiddenStoragePermissionMessage()
+            }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
@@ -129,6 +140,11 @@ class MainActivity : AppCompatActivity() {
         sbStrength.progress = settings.getInt("strength_progress", 35).coerceIn(0, sbStrength.max)
         cbFast.isChecked = settings.getBoolean("fast_mode", false)
         cbHideVideos.isChecked = settings.getBoolean("hide_videos", false)
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+            cbHideVideos.isChecked = false
+            cbHideVideos.isEnabled = false
+            cbHideVideos.text = "隐藏视频（需要 Android 11 或更高版本）"
+        }
         tvTarget.text = "目标响度：${targetLufs().toInt()} LUFS"
         tvStrength.text = "均衡力度：${(strength() * 100).toInt()}%"
 
@@ -167,7 +183,7 @@ class MainActivity : AppCompatActivity() {
                 tvStage.text = "正在取消并清理…"
                 updateStartText()
             } else {
-                startProcessing()
+                startProcessingWithStorageCheck()
             }
         }
 
@@ -553,7 +569,7 @@ class MainActivity : AppCompatActivity() {
         cbRepair.isEnabled = !b
         cbConcat.isEnabled = !b && picked.size > 1
         cbFast.isEnabled = !b
-        cbHideVideos.isEnabled = !b
+        cbHideVideos.isEnabled = !b && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
         rvFiles.visibility = if (b || picked.isEmpty()) View.GONE else View.VISIBLE
         fileAdapter.notifyDataSetChanged()   // 重新绑定，让每行「拼接」勾选框随忙碌禁用
         pbFile.visibility = if (b) View.VISIBLE else View.INVISIBLE
@@ -567,6 +583,41 @@ class MainActivity : AppCompatActivity() {
         updateStartText()
     }
 
+
+    private fun startProcessingWithStorageCheck() {
+        if (!cbHideVideos.isChecked) {
+            startProcessing()
+            return
+        }
+        if (Environment.isExternalStorageManager()) {
+            startProcessing()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("允许写入隐藏文件夹")
+            .setMessage("Android 不允许相册接口创建点号开头的文件夹。请开启“所有文件访问权限”，才能把成品直接保存到 Movies/.响度均衡。")
+            .setNegativeButton("取消", null)
+            .setPositiveButton("去开启") { _, _ ->
+                val intent = Intent(
+                    Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                    Uri.parse("package:$packageName"),
+                )
+                try {
+                    requestAllFilesAccess.launch(intent)
+                } catch (_: Exception) {
+                    requestAllFilesAccess.launch(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                }
+            }
+            .show()
+    }
+
+    private fun showHiddenStoragePermissionMessage() {
+        AlertDialog.Builder(this)
+            .setTitle("没有存储权限")
+            .setMessage("未获得权限，无法写入真正的 Movies/.响度均衡 隐藏文件夹。你可以取消勾选“隐藏视频”后保存到普通文件夹。")
+            .setPositiveButton("知道了", null)
+            .show()
+    }
 
     private fun startProcessing() {
         val required = requiredFreeBytes()
