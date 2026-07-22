@@ -98,7 +98,6 @@ fun showClipEditorDialog(
     var videoFailed = false
 
     val video = VideoView(context).apply {
-        setBackgroundColor(Color.BLACK)
         contentDescription = "视频裁剪预览"
         layoutParams = FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -229,7 +228,21 @@ fun showClipEditorDialog(
         }
         val timeUs = positionMs.coerceAtLeast(0L).coerceAtMost(Long.MAX_VALUE / 1000L) * 1000L
         return try {
-            retriever.getScaledFrameAtTime(
+            retriever.getFrameAtTime(timeUs, MediaMetadataRetriever.OPTION_CLOSEST)?.let { full ->
+                val maxDim = PREVIEW_MAX_DIMENSION
+                val maxSrc = maxOf(full.width, full.height)
+                if (maxSrc > maxDim) {
+                    val scale = maxDim.toFloat() / maxSrc
+                    val scaled = Bitmap.createScaledBitmap(
+                        full,
+                        (full.width * scale).toInt(),
+                        (full.height * scale).toInt(),
+                        true
+                    )
+                    full.recycle()
+                    scaled
+                } else full
+            } ?: retriever.getScaledFrameAtTime(
                 timeUs,
                 MediaMetadataRetriever.OPTION_CLOSEST,
                 PREVIEW_MAX_DIMENSION,
@@ -254,7 +267,7 @@ fun showClipEditorDialog(
             val session = FFmpegKit.executeWithArguments(
                 arrayOf(
                     "-hide_banner", "-loglevel", "error", "-y",
-                    "-ss", seconds,
+                    "-ss", seconds, "-accurate_seek",
                     "-i", FFmpegKitConfig.getSafParameterForRead(context, uri),
                     "-map", "0:v:0",
                     "-frames:v", "1",
@@ -275,10 +288,6 @@ fun showClipEditorDialog(
         }
     }
 
-    /**
-     * 优先用内置 FFmpeg 解码；失败后改用系统解码器，兼容相册可播但 FFmpeg 不支持的视频。
-     * 始终只处理一个请求；拖动很快时保留最新位置，避免启动大量 FFmpeg 会话。
-     */
     fun startNextFrameRequest() {
         if (frameClosed.get() || frameInFlight) return
         val requestedAt = pendingFramePositionMs ?: return
@@ -286,9 +295,7 @@ fun showClipEditorDialog(
         val generation = frameGeneration.get()
         frameInFlight = true
         frameExecutor.execute {
-            val ffmpegBitmap = if (preferSystemFrameExtractor) null else loadFfmpegFrame(requestedAt)
-            val bitmap = ffmpegBitmap ?: loadSystemFrame(requestedAt)
-            if (ffmpegBitmap == null && bitmap != null) preferSystemFrameExtractor = true
+            val bitmap = loadSystemFrame(requestedAt) ?: loadFfmpegFrame(requestedAt)
             handler.post {
                 frameInFlight = false
                 if (frameClosed.get() || generation != frameGeneration.get()) {
@@ -328,7 +335,7 @@ fun showClipEditorDialog(
             if (!frameClosed.get()) startNextFrameRequest()
         }
         pendingFrameRequest = request
-        handler.postDelayed(request, 80L)
+        handler.postDelayed(request, 20L)
     }
 
     fun findRangeAt(positionMs: Long): Int {

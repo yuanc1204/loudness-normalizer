@@ -112,6 +112,7 @@ class ProcessingService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var processor: VideoProcessor? = null
     private var currentRunId = 0L
+    private var taskStartTimeMs = 0L
     private var lastNotificationAt = 0L
     private var pendingProgress = 0
     private var pendingText = "准备处理…"
@@ -155,6 +156,7 @@ class ProcessingService : Service() {
         val request = ProcessingRequest.fromJson(intent.getStringExtra(EXTRA_REQUEST))
         currentRunId = request?.runId ?: mutableState.value.runId
         isRunning = true
+        taskStartTimeMs = SystemClock.elapsedRealtime()
         wakeLock = getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Loudnorm:Processing")
             .apply {
@@ -218,10 +220,21 @@ class ProcessingService : Service() {
         mainHandler.post {
             if (!isRunning) return@post
             pendingProgress = maxOf(pendingProgress, progress.coerceIn(0, 100))
-            pendingText = text
+
+            val elapsedMs = SystemClock.elapsedRealtime() - taskStartTimeMs
+            val etaStr = if (pendingProgress in 5..98 && elapsedMs > 2000) {
+                val totalEstMs = elapsedMs * 100 / pendingProgress
+                val remSec = maxOf(0L, (totalEstMs - elapsedMs) / 1000)
+                if (remSec >= 60) " (预估剩余 ${remSec / 60}分${remSec % 60}秒)"
+                else " (预估剩余 ${remSec}秒)"
+            } else ""
+
+            val cleanText = if (text.contains(" (预估剩余")) text.substringBefore(" (预估剩余") else text
+            pendingText = if (etaStr.isNotEmpty() && !cleanText.contains("取消")) "$cleanText$etaStr" else cleanText
+
             mutableState.update { current ->
                 if (current.runId == currentRunId) {
-                    current.copy(progress = maxOf(current.progress, pendingProgress), stage = text)
+                    current.copy(progress = maxOf(current.progress, pendingProgress), stage = pendingText)
                 } else current
             }
             val elapsed = SystemClock.elapsedRealtime() - lastNotificationAt

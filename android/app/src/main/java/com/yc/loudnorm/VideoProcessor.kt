@@ -1445,7 +1445,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         val finalMetadata = File(cacheDir, "final_${System.nanoTime()}.txt")
         val finalPath = finalMetadata.absolutePath.replace("\\", "/").replace(":", "\\:")
         try {
-            ui.stage("第 2 步 / 共 2 步：生成并保存（画面直接复制）…")
+            ui.stage("第 2 步 / 共 2 步：生成并保存…")
             val generatedAt = System.currentTimeMillis()
             val filter = Engine.buildFilter(target, volume, measured) +
                 ",ebur128=metadata=1,ametadata=mode=print:file='$finalPath'"
