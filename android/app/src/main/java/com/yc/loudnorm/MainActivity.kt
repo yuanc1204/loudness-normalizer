@@ -63,6 +63,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cbRepair: CheckBox
     private lateinit var cbConcat: CheckBox
     private lateinit var cbFast: CheckBox
+    private lateinit var cbHideVideos: CheckBox
 
     // inConcat：该视频是否被选入拼接组（勾选的视频合并成一个，按列表顺序）
     private class PickedFile(val uri: Uri, val name: String) {
@@ -122,10 +123,12 @@ class MainActivity : AppCompatActivity() {
         cbRepair = findViewById(R.id.cbRepair)
         cbConcat = findViewById(R.id.cbConcat)
         cbFast = findViewById(R.id.cbFast)
+        cbHideVideos = findViewById(R.id.cbHideVideos)
 
         sbTarget.progress = settings.getInt("target_progress", 4).coerceIn(0, sbTarget.max)
         sbStrength.progress = settings.getInt("strength_progress", 35).coerceIn(0, sbStrength.max)
         cbFast.isChecked = settings.getBoolean("fast_mode", false)
+        cbHideVideos.isChecked = settings.getBoolean("hide_videos", false)
         tvTarget.text = "目标响度：${targetLufs().toInt()} LUFS"
         tvStrength.text = "均衡力度：${(strength() * 100).toInt()}%"
 
@@ -144,6 +147,9 @@ class MainActivity : AppCompatActivity() {
         }
         cbFast.setOnCheckedChangeListener { _, checked ->
             settings.edit().putBoolean("fast_mode", checked).apply()
+        }
+        cbHideVideos.setOnCheckedChangeListener { _, checked ->
+            settings.edit().putBoolean("hide_videos", checked).apply()
         }
         // 底部「拼接」是总开关：勾选=全选所有视频进拼接组，取消=全不选
         cbConcat.setOnCheckedChangeListener { _, checked ->
@@ -547,6 +553,7 @@ class MainActivity : AppCompatActivity() {
         cbRepair.isEnabled = !b
         cbConcat.isEnabled = !b && picked.size > 1
         cbFast.isEnabled = !b
+        cbHideVideos.isEnabled = !b
         rvFiles.visibility = if (b || picked.isEmpty()) View.GONE else View.VISIBLE
         fileAdapter.notifyDataSetChanged()   // 重新绑定，让每行「拼接」勾选框随忙碌禁用
         pbFile.visibility = if (b) View.VISIBLE else View.INVISIBLE
@@ -586,12 +593,14 @@ class MainActivity : AppCompatActivity() {
         val strength = strength()
         val repair = cbRepair.isChecked
         val fastMode = cbFast.isChecked
+        val hideVideos = cbHideVideos.isChecked
         val request = ProcessingRequest(
             runId = System.currentTimeMillis(),
             target = target,
             strength = strength,
             repair = repair,
             fastMode = fastMode,
+            hideVideos = hideVideos,
             files = picked.map { file ->
                 ProcessingInput(
                     uriText = file.uri.toString(),

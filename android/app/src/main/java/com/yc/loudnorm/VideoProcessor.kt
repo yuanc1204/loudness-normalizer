@@ -43,6 +43,7 @@ data class ProcessingRequest(
     val strength: Double,
     val repair: Boolean,
     val fastMode: Boolean,
+    val hideVideos: Boolean,
     val files: List<ProcessingInput>,
 ) {
     fun toJson(): String = JSONObject().apply {
@@ -51,6 +52,7 @@ data class ProcessingRequest(
         put("strength", strength)
         put("repair", repair)
         put("fastMode", fastMode)
+        put("hideVideos", hideVideos)
         put("files", JSONArray().apply {
             for (file in files) {
                 put(JSONObject().apply {
@@ -103,6 +105,7 @@ data class ProcessingRequest(
                     strength = root.getDouble("strength"),
                     repair = root.getBoolean("repair"),
                     fastMode = root.optBoolean("fastMode", false),
+                    hideVideos = root.optBoolean("hideVideos", false),
                     files = files,
                 )
             } catch (_: Exception) {
@@ -137,6 +140,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
     private val preciseVideoEncodeLock = java.util.concurrent.Semaphore(1)
     private val durationCache = ConcurrentHashMap<String, Long>()
     private val fastVideoComposer = FastVideoComposer(appContext)
+    private var outputFolderName = "响度均衡"
 
     private class ProcessingCanceledException : RuntimeException()
 
@@ -156,6 +160,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
     }
 
     suspend fun process(request: ProcessingRequest): BatchResult = coroutineScope {
+        outputFolderName = if (request.hideVideos) ".响度均衡" else "响度均衡"
         val t0 = System.currentTimeMillis()
         val doConcat = request.files.count { it.inConcat } >= 2
         val concatFiles = if (doConcat) request.files.filter { it.inConcat } else emptyList()
@@ -246,7 +251,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
             val ok = results.count { it }
             callbacks.log("")
             callbacks.log("全部完成：成功 $ok 个，失败 ${jobs.size - ok} 个，总耗时 ${elapsed(t0)}。")
-            if (ok > 0) callbacks.log("成品在相册（或文件管理器）的 Movies/响度均衡 文件夹里。")
+            if (ok > 0) callbacks.log("成品在 Movies/$outputFolderName 文件夹里。")
             BatchResult(ok > 0, "成功 $ok 个，失败 ${jobs.size - ok} 个")
         }
     }
@@ -333,7 +338,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, outName)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/响度均衡")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/$outputFolderName")
             put(MediaStore.Video.Media.IS_PENDING, 1)
         }
         val outUri = contentResolver.insert(
@@ -388,7 +393,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, outName)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/响度均衡")
+            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/$outputFolderName")
             put(MediaStore.Video.Media.IS_PENDING, 1)
         }
         val outUri = contentResolver.insert(

@@ -106,6 +106,14 @@
         android:text="快速模式"
         android:textSize="13sp" />
 
+    <CheckBox
+        android:id="@+id/cbHideVideos"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:text="隐藏视频（保存到 .响度均衡）"
+        android:textSize="13sp" />
+
     <Button
         android:id="@+id/btnStart"
         android:layout_width="match_parent"
