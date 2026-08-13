@@ -14,13 +14,12 @@
 
 ## 界面截图
 
-### 音视频响度处理
-
-![音视频响度处理首页](docs/screenshots/home-processing.jpg)
-
-### 视频裁剪
-
-![视频裁剪界面](docs/screenshots/video-trim.jpg)
+<p align="center">
+  <a href="docs/screenshots/home-processing.jpg"><img src="docs/screenshots/home-processing.jpg" width="280" alt="音视频响度处理首页"></a>
+  &nbsp;&nbsp;
+  <a href="docs/screenshots/video-trim.jpg"><img src="docs/screenshots/video-trim.jpg" width="280" alt="视频裁剪界面"></a>
+</p>
+<p align="center"><sub>音视频响度处理　｜　视频裁剪</sub></p>
 
 ## 保存位置
 
@@ -43,12 +42,4 @@ gradle assembleDebug --no-daemon
 android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-## 桌面版
-
-仓库同时保留 Python 桌面脚本，可在仓库根目录运行：
-
-```powershell
-python 响度均衡.py sample.mp4
-```
-
-更多操作见 [安卓使用说明.txt](安卓使用说明.txt) 和 [使用说明.txt](使用说明.txt)。
+详细操作见 [安卓使用说明.txt](安卓使用说明.txt)。
