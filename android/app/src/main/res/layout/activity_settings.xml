@@ -92,7 +92,7 @@
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="使用更快的 AAC 编码方式，可能轻微降低音质。默认关闭。"
+            android:text="使用更快的 AAC 编码方式，可能轻微降低音质。默认开启。"
             android:textSize="12sp" />
 
         <TextView

@@ -45,7 +45,7 @@ class SettingsActivity : AppCompatActivity() {
             updateSaveLocation()
         }
 
-        cbFast.isChecked = settings.getBoolean("fast_mode", false)
+        cbFast.isChecked = settings.getBoolean("fast_mode", true)
         cbFast.setOnCheckedChangeListener { _, checked ->
             settings.edit().putBoolean("fast_mode", checked).apply()
         }

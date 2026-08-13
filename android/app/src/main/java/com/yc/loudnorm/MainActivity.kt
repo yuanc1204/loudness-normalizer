@@ -173,7 +173,11 @@ class MainActivity : AppCompatActivity() {
         setHelp(R.id.helpTarget, "目标响度", "成品希望达到的平均听感响度。-16 LUFS 适合大多数视频和课堂录音；数值越接近 0，声音越响。")
         setHelp(R.id.helpStrength, "均衡力度", "控制小声音段向目标响度靠近的程度。85% 能明显改善忽大忽小，同时保留一些自然起伏；100% 更平整。")
         setHelp(R.id.helpConcat, "视频拼接", "仅对视频生效。勾选后，参与拼接的视频会按列表顺序合成一个文件；可拖动调整顺序。音频不会加入视频拼接。")
-        setHelp(R.id.helpRepair, "仅修复播放卡顿", "只重新整理视频封装，不调整音量，通常几秒完成且画面无损。选择了纯音频时此选项不可用。")
+        setHelp(
+            R.id.helpRepair,
+            "仅修复播放卡顿",
+            "原理：不重新压缩画面和声音，只把原有音视频数据重新封装进新的 MP4，并重建时间戳、索引和交错顺序。它可修复因封装或时间轴异常造成的拖动失败、音画不同步、局部卡顿；如果原始画面数据本身已经损坏，则无法修复。通常几秒完成且画质无损。选择纯音频时不可用。",
+        )
         btnStart.setOnClickListener {
             if (busy) {
                 ProcessingService.cancel()
@@ -667,7 +671,7 @@ class MainActivity : AppCompatActivity() {
         val target = targetLufs()
         val strength = strength()
         val repair = cbRepair.isChecked
-        val fastMode = settings.getBoolean("fast_mode", false)
+        val fastMode = settings.getBoolean("fast_mode", true)
         val hideVideos = settings.getBoolean("hide_videos", false)
         val customOutputTreeUri = settings.getString("output_tree_uri", null)
         val request = ProcessingRequest(

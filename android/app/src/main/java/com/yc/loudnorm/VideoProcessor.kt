@@ -886,9 +886,42 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         return runFFmpeg(args.toTypedArray(), onTimeMs = onTimeMs)
     }
 
-    private fun aacArgs(fastMode: Boolean): List<String> =
-        if (fastMode) listOf("-c:a", "aac", "-b:a", "192k", "-aac_coder", "fast")
-        else listOf("-c:a", "aac", "-b:a", "192k")
+    private fun aacArgs(fastMode: Boolean, bitrate: Int = 192_000): List<String> {
+        val safeBitrate = bitrate.coerceIn(32_000, 192_000)
+        val args = mutableListOf("-c:a", "aac", "-b:a", safeBitrate.toString())
+        if (fastMode) args.addAll(listOf("-aac_coder", "fast"))
+        return args
+    }
+
+    /** 纯音频输出不盲目升到 192 kbps，优先沿用源音轨码率，避免课堂录音体积膨胀。 */
+    private fun sourceAudioBitrate(file: ProcessingInput): Int {
+        try {
+            contentResolver.openFileDescriptor(file.uri, "r")?.use { descriptor ->
+                val extractor = MediaExtractor()
+                try {
+                    extractor.setDataSource(descriptor.fileDescriptor)
+                    for (index in 0 until extractor.trackCount) {
+                        val format = extractor.getTrackFormat(index)
+                        val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                        if (!mime.startsWith("audio/")) continue
+                        if (format.containsKey(MediaFormat.KEY_BIT_RATE)) {
+                            val bitrate = format.getInteger(MediaFormat.KEY_BIT_RATE)
+                            if (bitrate > 0) return bitrate.coerceIn(32_000, 192_000)
+                        }
+                    }
+                } finally {
+                    extractor.release()
+                }
+            }
+        } catch (_: Exception) {
+        }
+        val duration = sourceDurationMs(file)
+        val size = contentSize(file.uri)
+        if (duration > 0L && size > 0L) {
+            return (size * 8_000L / duration).toInt().coerceIn(32_000, 192_000)
+        }
+        return 64_000
+    }
 
     private fun preciseClipArgs(
         inputProviders: List<() -> String>,
@@ -1612,16 +1645,21 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         strength: Double,
         fastMode: Boolean,
         ui: JobUi,
-    ): Boolean = processInput(
-        input = { FFmpegKitConfig.getSafParameterForRead(appContext, file.uri) },
-        name = file.name,
-        durationMs = sourceDurationMs(file),
-        target = target,
-        strength = strength,
-        fastMode = fastMode,
-        ui = ui,
-        isAudio = true,
-    )
+    ): Boolean {
+        val bitrate = sourceAudioBitrate(file)
+        ui.log("  原音频约 ${bitrate / 1000} kbps，输出沿用该码率")
+        return processInput(
+            input = { FFmpegKitConfig.getSafParameterForRead(appContext, file.uri) },
+            name = file.name,
+            durationMs = sourceDurationMs(file),
+            target = target,
+            strength = strength,
+            fastMode = fastMode,
+            ui = ui,
+            isAudio = true,
+            audioBitrate = bitrate,
+        )
+    }
 
     private fun processInput(
         input: () -> String,
@@ -1632,6 +1670,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         fastMode: Boolean,
         ui: JobUi,
         isAudio: Boolean = false,
+        audioBitrate: Int = 192_000,
     ): Boolean {
         val duration = durationMs.coerceAtLeast(1L).toDouble()
         ui.stage("第 1 步 / 共 2 步：扫描响度…")
@@ -1716,7 +1755,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
                     )
                 )
                 if (!isAudio) args.addAll(listOf("-map", "0:v?", "-c:v", "copy"))
-                args.addAll(aacArgs(fastMode))
+                args.addAll(aacArgs(fastMode, audioBitrate))
                 args.addAll(listOf("-f", "mp4", output))
                 runFFmpeg(
                     args.toTypedArray(),
