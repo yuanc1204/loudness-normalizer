@@ -1,5 +1,7 @@
 # 响度均衡
 
+[中文](README.md) | [English](README_EN.md)
+
 一款本地处理视频和录音响度的工具，提供 Android App 和 Windows 脚本。它会分析不同时间段的听感响度，重点提升偏小的声音，同时尽量保留自然起伏。
 
 ## 功能
