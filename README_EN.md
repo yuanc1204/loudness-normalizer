@@ -4,6 +4,11 @@
 
 A local loudness-normalization tool for videos and voice recordings, available as an Android app and a Windows script. It analyzes perceived loudness over time, raises quieter sections, and preserves natural dynamics as much as possible.
 
+## Download for Android
+
+Open the [latest release](https://github.com/yuanc1204/loudness-normalizer/releases/latest), download the APK, and install it.
+If Android blocks the installation, follow the system prompt to allow your browser or file manager to install unknown apps.
+
 ## Features
 
 - Import multiple videos or audio files, or share media directly from Telegram and other apps
@@ -25,9 +30,7 @@ A local loudness-normalization tool for videos and voice recordings, available a
 
 ## Android
 
-Download the latest APK from [GitHub Releases](https://github.com/yuanc1204/loudness-normalizer/releases).
-
-1. Install the APK and open **Loudness Normalizer** (`响度均衡`).
+1. Download the APK from the [latest release](https://github.com/yuanc1204/loudness-normalizer/releases/latest), install it, and open **Loudness Normalizer** (`响度均衡`).
 2. Tap **Select video or audio**. Media can also be shared directly to the app from Telegram and other apps.
 3. Adjust the target loudness and normalization strength if needed; the defaults work well for most recordings.
 4. Tap a video thumbnail to trim it, or select and reorder multiple videos for concatenation.
@@ -40,12 +43,12 @@ Default output locations:
 - A custom folder can be selected in Settings
 - On Android 11 and later, videos can optionally be stored in the hidden folder `Movies/.响度均衡`
 
-### Build the Android app
+### Build for development
 
-Requirements: JDK 17, Android SDK 34, and Gradle 8.9. Run from the `android` directory:
+Requirements: JDK 17 and Android SDK 34. Run from the `android` directory:
 
 ```powershell
-gradle assembleDebug --no-daemon
+.\gradlew.bat assembleDebug --no-daemon
 ```
 
 The debug APK is generated at:
@@ -54,28 +57,16 @@ The debug APK is generated at:
 android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-For a signed release, create a local `android/keystore.properties` file and the keystore referenced by it, then run:
-
-```powershell
-gradle assembleRelease --no-daemon
-```
-
-The signed APK is generated at `android/app/build/outputs/apk/release/app-release.apk`.
-The keystore and password configuration are ignored by Git. Keep both securely backed up, because all future updates must use the same signing key.
-
-Release certificate SHA-256:
-
-```text
-85:86:84:22:A5:76:5E:3A:83:C4:7B:52:C1:63:2D:85:01:F3:84:B4:8B:EB:4C:71:14:8B:20:0C:94:06:33:E4
-```
-
 ## Windows
 
 The Windows version provides a quick way to try video loudness normalization without installing the Android app. It requires Python 3.9 or later, plus `ffmpeg` and `ffprobe` available on `PATH`.
 
-The simplest method is to drag one or more videos onto `响度均衡.bat`. Processed files are written to the `输出` folder in the repository root, and the source videos are left unchanged.
+1. Click **Code** on the repository page, choose **Download ZIP**, and extract it.
+2. Install [Python](https://www.python.org/downloads/) and [FFmpeg](https://ffmpeg.org/download.html), ensuring both are available from the command line.
+3. Drag one or more videos onto `响度均衡.bat`.
+4. Find the processed files in the `输出` folder. Source videos are never modified.
 
-Command-line examples:
+Command-line examples for advanced users:
 
 ```powershell
 # Process every video in the current folder
@@ -92,3 +83,7 @@ python 响度均衡.py --target -14 --strength 0.95 --jobs 3 video.mp4
 ```
 
 The Windows script currently processes video files only. It copies the video stream and re-encodes only the audio. Supported containers include `mp4`, `mkv`, `mov`, `avi`, `flv`, `ts`, `m4v`, `webm`, `wmv`, `mpg`, and `mpeg`.
+
+## License
+
+Project source code is available under the [MIT License](LICENSE). Bundled dependencies remain under their respective licenses; see [Third-Party Notices](THIRD_PARTY_NOTICES.md).
