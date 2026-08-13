@@ -8,11 +8,16 @@
 安装
 ----
 
-APK 不纳入源码仓库。自行构建后，安装包位于：
+APK 不纳入源码仓库。调试安装包位于：
 android/app/build/outputs/apk/debug/app-debug.apk
+
+配置固定签名后，正式安装包位于：
+android/app/build/outputs/apk/release/app-release.apk
 
 把 APK 传到手机并打开，根据系统提示允许当前应用安装即可。
 当前应用 ID 与早期版本不同，因此可以并存安装，不会覆盖早期版本。
+Debug 版和正式签名版不能互相覆盖；第一次换成正式版时需要先卸载 Debug 版。
+之后只要始终使用同一份正式密钥，新版本就可以直接覆盖升级。
 
 基本使用
 --------

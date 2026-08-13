@@ -52,6 +52,22 @@ gradle assembleDebug --no-daemon
 android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
+正式发布前需在本机创建 `android/keystore.properties` 和其中指定的密钥文件，
+然后在 `android` 目录运行：
+
+```powershell
+gradle assembleRelease --no-daemon
+```
+
+签名后的正式 APK 位于 `android/app/build/outputs/apk/release/app-release.apk`。
+密钥和密码配置已被 Git 忽略，不能上传仓库；必须安全备份，后续版本需要使用同一密钥才能覆盖升级。
+
+正式签名证书 SHA-256：
+
+```text
+85:86:84:22:A5:76:5E:3A:83:C4:7B:52:C1:63:2D:85:01:F3:84:B4:8B:EB:4C:71:14:8B:20:0C:94:06:33:E4
+```
+
 ## Windows 使用
 
 Windows 版适合先在电脑上尝试视频响度均衡，不需要安装 Android App。
