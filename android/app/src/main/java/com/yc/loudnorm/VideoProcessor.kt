@@ -1673,6 +1673,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         audioBitrate: Int = 192_000,
     ): Boolean {
         val duration = durationMs.coerceAtLeast(1L).toDouble()
+        ui.log("正在扫描中，请稍等")
         ui.stage("第 1 步 / 共 2 步：扫描响度…")
         val metadataFile = File(cacheDir, "scan_${System.nanoTime()}.txt")
         val metadataPath = metadataFile.absolutePath.replace("\\", "/").replace(":", "\\:")
