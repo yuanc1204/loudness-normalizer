@@ -64,11 +64,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var pbFile: ProgressBar
     private lateinit var cbRepair: CheckBox
     private lateinit var cbConcat: CheckBox
-    private lateinit var cbFast: CheckBox
-    private lateinit var cbHideVideos: CheckBox
 
     // inConcat：该视频是否被选入拼接组（勾选的视频合并成一个，按列表顺序）
-    private class PickedFile(val uri: Uri, val name: String) {
+    private class PickedFile(val uri: Uri, val name: String, val isAudio: Boolean) {
         var inConcat = false
         var thumbnail: Bitmap? = null
         var thumbnailRequested = false
@@ -95,7 +93,15 @@ class MainActivity : AppCompatActivity() {
             if (uris.isNullOrEmpty()) return@registerForActivityResult
             for (u in uris) {
                 if (picked.any { it.uri == u }) continue
-                picked.add(PickedFile(u, displayName(u) ?: "视频${picked.size + 1}"))
+                val name = displayName(u) ?: "媒体文件${picked.size + 1}"
+                picked.add(PickedFile(u, name, isAudioUri(u, name)))
+                try {
+                    contentResolver.takePersistableUriPermission(
+                        u,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION,
+                    )
+                } catch (_: Exception) {
+                }
             }
             refreshFileList()
         }
@@ -133,18 +139,9 @@ class MainActivity : AppCompatActivity() {
         pbFile = findViewById(R.id.pbFile)
         cbRepair = findViewById(R.id.cbRepair)
         cbConcat = findViewById(R.id.cbConcat)
-        cbFast = findViewById(R.id.cbFast)
-        cbHideVideos = findViewById(R.id.cbHideVideos)
 
         sbTarget.progress = settings.getInt("target_progress", 4).coerceIn(0, sbTarget.max)
         sbStrength.progress = settings.getInt("strength_progress", 35).coerceIn(0, sbStrength.max)
-        cbFast.isChecked = settings.getBoolean("fast_mode", false)
-        cbHideVideos.isChecked = settings.getBoolean("hide_videos", false)
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-            cbHideVideos.isChecked = false
-            cbHideVideos.isEnabled = false
-            cbHideVideos.text = "隐藏视频（需要 Android 11 或更高版本）"
-        }
         tvTarget.text = "目标响度：${targetLufs().toInt()} LUFS"
         tvStrength.text = "均衡力度：${(strength() * 100).toInt()}%"
 
@@ -161,21 +158,22 @@ class MainActivity : AppCompatActivity() {
             sbStrength.isEnabled = !checked && !busy
             updateStartText()
         }
-        cbFast.setOnCheckedChangeListener { _, checked ->
-            settings.edit().putBoolean("fast_mode", checked).apply()
-        }
-        cbHideVideos.setOnCheckedChangeListener { _, checked ->
-            settings.edit().putBoolean("hide_videos", checked).apply()
-        }
         // 底部「拼接」是总开关：勾选=全选所有视频进拼接组，取消=全不选
         cbConcat.setOnCheckedChangeListener { _, checked ->
             if (syncingConcat) return@setOnCheckedChangeListener
-            picked.forEach { it.inConcat = checked }
+            picked.filterNot { it.isAudio }.forEach { it.inConcat = checked }
             updateStartText()
             refreshFileList()
         }
 
-        btnPick.setOnClickListener { pickVideos.launch(arrayOf("video/*")) }
+        btnPick.setOnClickListener { pickVideos.launch(arrayOf("video/*", "audio/*")) }
+        findViewById<Button>(R.id.btnSettings).setOnClickListener {
+            startActivity(Intent(this, SettingsActivity::class.java))
+        }
+        setHelp(R.id.helpTarget, "目标响度", "成品希望达到的平均听感响度。-16 LUFS 适合大多数视频和课堂录音；数值越接近 0，声音越响。")
+        setHelp(R.id.helpStrength, "均衡力度", "控制小声音段向目标响度靠近的程度。85% 能明显改善忽大忽小，同时保留一些自然起伏；100% 更平整。")
+        setHelp(R.id.helpConcat, "视频拼接", "仅对视频生效。勾选后，参与拼接的视频会按列表顺序合成一个文件；可拖动调整顺序。音频不会加入视频拼接。")
+        setHelp(R.id.helpRepair, "仅修复播放卡顿", "只重新整理视频封装，不调整音量，通常几秒完成且画面无损。选择了纯音频时此选项不可用。")
         btnStart.setOnClickListener {
             if (busy) {
                 ProcessingService.cancel()
@@ -232,7 +230,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 接收从 Telegram 等 App 分享过来的视频，直接加进待处理列表。 */
+    /** 接收从 Telegram 等 App 分享过来的音视频，直接加进待处理列表。 */
     private fun handleShareIntent(intent: Intent?) {
         intent ?: return
         @Suppress("DEPRECATION")
@@ -246,12 +244,13 @@ class MainActivity : AppCompatActivity() {
         }
         if (uris.isEmpty()) return
         if (busy) {
-            log("正在处理中，请稍后再分享新视频。")
+            log("正在处理中，请稍后再分享新文件。")
             return
         }
         for (u in uris) {
             if (picked.any { it.uri == u }) continue
-            picked.add(PickedFile(u, displayName(u) ?: "分享的视频${picked.size + 1}"))
+            val name = displayName(u) ?: "分享的媒体${picked.size + 1}"
+            picked.add(PickedFile(u, name, isAudioUri(u, name)))
         }
         refreshFileList()
     }
@@ -260,7 +259,17 @@ class MainActivity : AppCompatActivity() {
     private fun strength() = (50 + sbStrength.progress) / 100.0   // 0..50 → 0.5..1.0
 
     /** 拼接组有效需 2 个以上视频；不足按各自单独处理。 */
-    private fun willConcat() = picked.count { it.inConcat } >= 2
+    private fun willConcat() = picked.count { it.inConcat && !it.isAudio } >= 2
+
+    private fun setHelp(viewId: Int, title: String, message: String) {
+        findViewById<TextView>(viewId).setOnClickListener {
+            AlertDialog.Builder(this)
+                .setTitle(title)
+                .setMessage(message)
+                .setPositiveButton("知道了", null)
+                .show()
+        }
+    }
 
     private fun updateStartText() {
         if (busy) {
@@ -343,18 +352,20 @@ class MainActivity : AppCompatActivity() {
             val pf = picked[position]
             h.name.text = fileRowText(pf)
             val thumbnail = pf.thumbnail
-            if (thumbnail != null) {
+            if (pf.isAudio) {
+                h.preview.setImageResource(android.R.drawable.ic_lock_silent_mode_off)
+            } else if (thumbnail != null) {
                 h.preview.setImageBitmap(thumbnail)
             } else {
                 h.preview.setImageResource(android.R.drawable.ic_media_play)
                 requestThumbnail(pf)
             }
-            h.preview.isEnabled = !busy
-            h.preview.alpha = if (busy) 0.5f else 1f
-            h.preview.contentDescription = "裁剪 ${pf.name}"
+            h.preview.isEnabled = !busy && !pf.isAudio
+            h.preview.alpha = if (busy || pf.isAudio) 0.5f else 1f
+            h.preview.contentDescription = if (pf.isAudio) "音频 ${pf.name}" else "裁剪 ${pf.name}"
             h.preview.setOnClickListener {
                 val current = picked.getOrNull(h.bindingAdapterPosition) ?: return@setOnClickListener
-                if (!busy) showClipEditor(current)
+                if (!busy && !current.isAudio) showClipEditor(current)
             }
             h.handle.visibility = if (picked.size > 1) View.VISIBLE else View.GONE
             h.handle.setOnTouchListener { v, ev ->
@@ -365,7 +376,7 @@ class MainActivity : AppCompatActivity() {
                 false
             }
             // 拼接勾选框：单个视频时无意义，隐藏
-            h.cbCat.visibility = if (picked.size > 1) View.VISIBLE else View.GONE
+            h.cbCat.visibility = if (!pf.isAudio && picked.count { !it.isAudio } > 1) View.VISIBLE else View.GONE
             h.cbCat.isEnabled = !busy
             h.cbCat.setOnCheckedChangeListener(null)
             h.cbCat.isChecked = pf.inConcat
@@ -386,6 +397,7 @@ class MainActivity : AppCompatActivity() {
 
     /** 用独立 FFmpeg 线程池并行抽取低分辨率关键帧，系统缩略图仅作为失败兜底。 */
     private fun requestThumbnail(pf: PickedFile) {
+        if (pf.isAudio) return
         if (pf.thumbnailRequested) return
         pf.thumbnailRequested = true
         val revision = pf.editRevision
@@ -468,12 +480,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun fileRowText(pf: PickedFile): String {
+        if (pf.isAudio) return "${pf.name}\n音频"
         val ranges = pf.clipRanges ?: return pf.name
         val kept = ranges.sumOf { it.durationMs }
         return "${pf.name}\n已裁剪：保留 ${ranges.size} 段 · ${formatShortTime(kept)}"
     }
 
     private fun showClipEditor(pf: PickedFile) {
+        if (pf.isAudio) return
         if (clipEditorLoading) return
         clipEditorLoading = true
         lifecycleScope.launch {
@@ -507,7 +521,8 @@ class MainActivity : AppCompatActivity() {
 
     /** 每行勾选变化后，把底部总开关同步为「是否全部已选」，且不反过来触发它的监听。 */
     private fun syncMasterConcat() {
-        val all = picked.isNotEmpty() && picked.all { it.inConcat }
+        val videos = picked.filterNot { it.isAudio }
+        val all = videos.size >= 2 && videos.all { it.inConcat }
         if (cbConcat.isChecked != all) {
             syncingConcat = true
             cbConcat.isChecked = all
@@ -538,7 +553,7 @@ class MainActivity : AppCompatActivity() {
     @Suppress("NotifyDataSetChanged")
     private fun refreshFileList() {
         // 选择完成后一次性发起全部请求，不再等 RecyclerView 逐行绑定。
-        picked.forEach(::requestThumbnail)
+        picked.filterNot { it.isAudio }.forEach(::requestThumbnail)
         fileAdapter.notifyDataSetChanged()
         rvFiles.visibility = if (busy || picked.isEmpty()) View.GONE else View.VISIBLE
         // 缩略图列表最多显示三行，更多视频在列表内滚动，给下面的日志区留空间。
@@ -547,9 +562,18 @@ class MainActivity : AppCompatActivity() {
             height = if (picked.size > 3) (132 * dp).toInt()
             else ViewGroup.LayoutParams.WRAP_CONTENT
         }
-        tvSelected.text = if (picked.isEmpty()) "未选择视频" else "已选择 ${picked.size} 个视频"
+        val videos = picked.count { !it.isAudio }
+        val audios = picked.count { it.isAudio }
+        tvSelected.text = when {
+            picked.isEmpty() -> "未选择文件"
+            videos > 0 && audios > 0 -> "已选择 $videos 个视频、$audios 个音频"
+            videos > 0 -> "已选择 $videos 个视频"
+            else -> "已选择 $audios 个音频"
+        }
         btnStart.isEnabled = if (busy) !cancelRequested.get() else picked.isNotEmpty()
-        cbConcat.isEnabled = picked.size > 1 && !busy
+        cbConcat.isEnabled = videos > 1 && !busy
+        if (audios > 0 && cbRepair.isChecked) cbRepair.isChecked = false
+        cbRepair.isEnabled = !busy && audios == 0
         syncMasterConcat()
         updateStartText()
     }
@@ -566,10 +590,8 @@ class MainActivity : AppCompatActivity() {
         btnStart.isEnabled = if (b) !cancelRequested.get() else picked.isNotEmpty()
         sbTarget.isEnabled = !b && !cbRepair.isChecked
         sbStrength.isEnabled = !b && !cbRepair.isChecked
-        cbRepair.isEnabled = !b
-        cbConcat.isEnabled = !b && picked.size > 1
-        cbFast.isEnabled = !b
-        cbHideVideos.isEnabled = !b && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+        cbRepair.isEnabled = !b && picked.none { it.isAudio }
+        cbConcat.isEnabled = !b && picked.count { !it.isAudio } > 1
         rvFiles.visibility = if (b || picked.isEmpty()) View.GONE else View.VISIBLE
         fileAdapter.notifyDataSetChanged()   // 重新绑定，让每行「拼接」勾选框随忙碌禁用
         pbFile.visibility = if (b) View.VISIBLE else View.INVISIBLE
@@ -585,7 +607,9 @@ class MainActivity : AppCompatActivity() {
 
 
     private fun startProcessingWithStorageCheck() {
-        if (!cbHideVideos.isChecked) {
+        val customOutputTreeUri = settings.getString("output_tree_uri", null)
+        val hideVideos = settings.getBoolean("hide_videos", false)
+        if (customOutputTreeUri != null || !hideVideos) {
             startProcessing()
             return
         }
@@ -643,8 +667,9 @@ class MainActivity : AppCompatActivity() {
         val target = targetLufs()
         val strength = strength()
         val repair = cbRepair.isChecked
-        val fastMode = cbFast.isChecked
-        val hideVideos = cbHideVideos.isChecked
+        val fastMode = settings.getBoolean("fast_mode", false)
+        val hideVideos = settings.getBoolean("hide_videos", false)
+        val customOutputTreeUri = settings.getString("output_tree_uri", null)
         val request = ProcessingRequest(
             runId = System.currentTimeMillis(),
             target = target,
@@ -652,6 +677,7 @@ class MainActivity : AppCompatActivity() {
             repair = repair,
             fastMode = fastMode,
             hideVideos = hideVideos,
+            customOutputTreeUri = customOutputTreeUri,
             files = picked.map { file ->
                 ProcessingInput(
                     uriText = file.uri.toString(),
@@ -659,6 +685,7 @@ class MainActivity : AppCompatActivity() {
                     durationMs = sourceDurationMs(file),
                     clipRanges = file.clipRanges?.toList(),
                     inConcat = file.inConcat,
+                    isAudio = file.isAudio,
                 )
             },
         )
@@ -724,6 +751,15 @@ class MainActivity : AppCompatActivity() {
     private fun sourceDurationMs(pf: PickedFile): Long {
         if (pf.durationMs > 0) return pf.durationMs
         return durationMs(pf.uri).also { if (it > 0) pf.durationMs = it }
+    }
+
+    private fun isAudioUri(uri: Uri, name: String): Boolean {
+        val mime = contentResolver.getType(uri)
+        if (mime?.startsWith("audio/") == true) return true
+        if (mime?.startsWith("video/") == true) return false
+        return name.substringAfterLast('.', "").lowercase() in setOf(
+            "mp3", "m4a", "aac", "wav", "flac", "ogg", "opus", "wma", "amr",
+        )
     }
 
     private fun formatShortTime(ms: Long): String {

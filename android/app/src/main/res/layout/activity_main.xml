@@ -5,32 +5,47 @@
     android:orientation="vertical"
     android:padding="20dp">
 
-    <TextView
-        android:layout_width="wrap_content"
+    <LinearLayout
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="视频响度均衡"
-        android:textSize="24sp"
-        android:textStyle="bold" />
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="音视频响度均衡"
+            android:textSize="24sp"
+            android:textStyle="bold" />
+
+        <Button
+            android:id="@+id/btnSettings"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:minWidth="0dp"
+            android:text="设置" />
+    </LinearLayout>
 
     <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="4dp"
-        android:text="小声段整段提升；未裁剪画面无损，可分割删除片段"
+        android:text="提升小声音段；支持视频、课堂录音等纯音频"
         android:textSize="13sp" />
 
     <Button
         android:id="@+id/btnPick"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="16dp"
-        android:text="选择视频" />
+        android:layout_marginTop="14dp"
+        android:text="选择视频或音频" />
 
     <TextView
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="4dp"
-        android:text="也可在 Telegram 等 App 里分享视频到「响度均衡」"
+        android:text="也可从 Telegram 等 App 分享音视频到本应用"
         android:textSize="12sp" />
 
     <TextView
@@ -38,7 +53,7 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="4dp"
-        android:text="未选择视频"
+        android:text="未选择文件"
         android:textSize="13sp" />
 
     <androidx.recyclerview.widget.RecyclerView
@@ -51,15 +66,33 @@
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
         android:layout_marginTop="2dp"
-        android:text="点击视频预览图可裁剪；分割后点选片段即可删除"
+        android:text="视频可点预览图裁剪；音频将直接进行响度均衡"
         android:textSize="12sp" />
 
-    <TextView
-        android:id="@+id/tvTarget"
-        android:layout_width="wrap_content"
+    <LinearLayout
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
-        android:text="目标响度：-16 LUFS" />
+        android:layout_marginTop="10dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/tvTarget"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="目标响度：-16 LUFS" />
+
+        <TextView
+            android:id="@+id/helpTarget"
+            android:layout_width="24dp"
+            android:layout_height="24dp"
+            android:background="@drawable/bg_help_circle"
+            android:gravity="center"
+            android:text="?"
+            android:textColor="#FFFFFF"
+            android:textStyle="bold" />
+    </LinearLayout>
 
     <SeekBar
         android:id="@+id/sbTarget"
@@ -68,12 +101,30 @@
         android:max="8"
         android:progress="4" />
 
-    <TextView
-        android:id="@+id/tvStrength"
-        android:layout_width="wrap_content"
+    <LinearLayout
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="均衡力度：85%" />
+        android:layout_marginTop="4dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/tvStrength"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="均衡力度：85%" />
+
+        <TextView
+            android:id="@+id/helpStrength"
+            android:layout_width="24dp"
+            android:layout_height="24dp"
+            android:background="@drawable/bg_help_circle"
+            android:gravity="center"
+            android:text="?"
+            android:textColor="#FFFFFF"
+            android:textStyle="bold" />
+    </LinearLayout>
 
     <SeekBar
         android:id="@+id/sbStrength"
@@ -82,37 +133,55 @@
         android:max="50"
         android:progress="35" />
 
-    <CheckBox
-        android:id="@+id/cbConcat"
-        android:layout_width="wrap_content"
+    <LinearLayout
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="全部拼接成一个视频（拖动排序）"
-        android:textSize="13sp" />
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
 
-    <CheckBox
-        android:id="@+id/cbRepair"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="仅修复播放卡顿（不调音量，无损秒级）"
-        android:textSize="13sp" />
+        <CheckBox
+            android:id="@+id/cbConcat"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="全部拼接成一个视频（拖动排序）"
+            android:textSize="13sp" />
 
-    <CheckBox
-        android:id="@+id/cbFast"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="快速模式"
-        android:textSize="13sp" />
+        <TextView
+            android:id="@+id/helpConcat"
+            android:layout_width="24dp"
+            android:layout_height="24dp"
+            android:background="@drawable/bg_help_circle"
+            android:gravity="center"
+            android:text="?"
+            android:textColor="#FFFFFF"
+            android:textStyle="bold" />
+    </LinearLayout>
 
-    <CheckBox
-        android:id="@+id/cbHideVideos"
-        android:layout_width="wrap_content"
+    <LinearLayout
+        android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="4dp"
-        android:text="隐藏视频（保存到 .响度均衡）"
-        android:textSize="13sp" />
+        android:gravity="center_vertical"
+        android:orientation="horizontal">
+
+        <CheckBox
+            android:id="@+id/cbRepair"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="仅修复视频播放卡顿"
+            android:textSize="13sp" />
+
+        <TextView
+            android:id="@+id/helpRepair"
+            android:layout_width="24dp"
+            android:layout_height="24dp"
+            android:background="@drawable/bg_help_circle"
+            android:gravity="center"
+            android:text="?"
+            android:textColor="#FFFFFF"
+            android:textStyle="bold" />
+    </LinearLayout>
 
     <Button
         android:id="@+id/btnStart"

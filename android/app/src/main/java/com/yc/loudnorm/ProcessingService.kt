@@ -24,7 +24,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
-/** 持有整批视频任务，让切换 App、返回桌面或锁屏后仍能可靠处理和通知。 */
+/** 持有整批音视频任务，让切换 App、返回桌面或锁屏后仍能可靠处理和通知。 */
 class ProcessingService : Service() {
 
     data class TaskResult(
@@ -67,7 +67,7 @@ class ProcessingService : Service() {
 
         /** 只传递可序列化任务数据；服务自行创建处理器，不保存 Activity 或界面回调。 */
         fun start(context: Context, request: ProcessingRequest) {
-            check(!mutableState.value.running && !isRunning) { "已有视频处理任务正在运行" }
+            check(!mutableState.value.running && !isRunning) { "已有音视频处理任务正在运行" }
             cancelBeforeStart = false
             mutableState.value = ProcessingState(
                 runId = request.runId,
@@ -132,14 +132,14 @@ class ProcessingService : Service() {
         super.onCreate()
         instance = this
         val progressChannel = NotificationChannel(
-            CHANNEL_ID, "视频处理进度", NotificationManager.IMPORTANCE_LOW
-        ).apply { description = "响度均衡的后台处理进度" }
+            CHANNEL_ID, "音视频处理进度", NotificationManager.IMPORTANCE_LOW
+        ).apply { description = "音视频响度均衡的后台处理进度" }
         getSystemService(NotificationManager::class.java).createNotificationChannel(progressChannel)
 
         val completeChannel = NotificationChannel(
             COMPLETE_CHANNEL_ID, "处理完成提醒", NotificationManager.IMPORTANCE_HIGH
         ).apply {
-            description = "视频处理完成时弹出提醒"
+            description = "音视频处理完成时弹出提醒"
             enableVibration(true)
             lockscreenVisibility = Notification.VISIBILITY_PUBLIC
         }
@@ -276,7 +276,7 @@ class ProcessingService : Service() {
     private fun buildProgressNotification(progress: Int, text: String) =
         NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setContentTitle("响度均衡处理中")
+            .setContentTitle("音视频响度均衡处理中")
             .setContentText(text)
             .setProgress(100, progress, false)
             .setOngoing(true)
@@ -295,8 +295,8 @@ class ProcessingService : Service() {
                 if (success) android.R.drawable.stat_sys_upload_done
                 else android.R.drawable.stat_notify_error
             )
-            .setContentTitle(if (success) "视频处理完成" else "视频处理失败")
-            .setContentText(text.ifBlank { if (success) "成品已保存到相册" else "请打开 App 查看日志" })
+            .setContentTitle(if (success) "音视频处理完成" else "音视频处理失败")
+            .setContentText(text.ifBlank { if (success) "成品已保存" else "请打开 App 查看日志" })
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_EVENT)
             .setDefaults(Notification.DEFAULT_ALL)

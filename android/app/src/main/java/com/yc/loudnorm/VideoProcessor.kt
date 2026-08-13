@@ -7,8 +7,10 @@ import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import androidx.documentfile.provider.DocumentFile
 import com.antonkarpenko.ffmpegkit.FFmpegKit
 import com.antonkarpenko.ffmpegkit.FFmpegKitConfig
 import com.antonkarpenko.ffmpegkit.FFmpegSession
@@ -33,6 +35,7 @@ data class ProcessingInput(
     val durationMs: Long,
     val clipRanges: List<ClipRange>?,
     val inConcat: Boolean,
+    val isAudio: Boolean,
 ) {
     val uri: Uri get() = Uri.parse(uriText)
 }
@@ -45,6 +48,7 @@ data class ProcessingRequest(
     val repair: Boolean,
     val fastMode: Boolean,
     val hideVideos: Boolean,
+    val customOutputTreeUri: String?,
     val files: List<ProcessingInput>,
 ) {
     fun toJson(): String = JSONObject().apply {
@@ -54,6 +58,7 @@ data class ProcessingRequest(
         put("repair", repair)
         put("fastMode", fastMode)
         put("hideVideos", hideVideos)
+        customOutputTreeUri?.let { put("customOutputTreeUri", it) }
         put("files", JSONArray().apply {
             for (file in files) {
                 put(JSONObject().apply {
@@ -61,6 +66,7 @@ data class ProcessingRequest(
                     put("name", file.name)
                     put("durationMs", file.durationMs)
                     put("inConcat", file.inConcat)
+                    put("isAudio", file.isAudio)
                     file.clipRanges?.let { ranges ->
                         put("clipRanges", JSONArray().apply {
                             ranges.forEach { range ->
@@ -97,6 +103,7 @@ data class ProcessingRequest(
                             durationMs = item.optLong("durationMs", 0L),
                             clipRanges = ranges,
                             inConcat = item.optBoolean("inConcat", false),
+                            isAudio = item.optBoolean("isAudio", false),
                         )
                     )
                 }
@@ -107,6 +114,7 @@ data class ProcessingRequest(
                     repair = root.getBoolean("repair"),
                     fastMode = root.optBoolean("fastMode", false),
                     hideVideos = root.optBoolean("hideVideos", false),
+                    customOutputTreeUri = root.optString("customOutputTreeUri").ifBlank { null },
                     files = files,
                 )
             } catch (_: Exception) {
@@ -142,6 +150,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
     private val durationCache = ConcurrentHashMap<String, Long>()
     private val fastVideoComposer = FastVideoComposer(appContext)
     private var outputFolderName = "响度均衡"
+    private var customOutputTreeUri: Uri? = null
 
     private class ProcessingCanceledException : RuntimeException()
 
@@ -162,6 +171,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
 
     suspend fun process(request: ProcessingRequest): BatchResult = coroutineScope {
         outputFolderName = if (request.hideVideos) ".响度均衡" else "响度均衡"
+        customOutputTreeUri = request.customOutputTreeUri?.let(Uri::parse)
         val t0 = System.currentTimeMillis()
         val doConcat = request.files.count { it.inConcat } >= 2
         val concatFiles = if (doConcat) request.files.filter { it.inConcat } else emptyList()
@@ -180,11 +190,12 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         for (file in singleFiles) {
             val weight = effectiveDurationMs(file).coerceAtLeast(1L)
             jobs.add(Job(file.name, weight) { ui ->
-                if (request.repair) repairOne(file, request.fastMode, ui)
+                if (file.isAudio) processAudioOne(file, request.target, request.strength, request.fastMode, ui)
+                else if (request.repair) repairOne(file, request.fastMode, ui)
                 else processOne(file, request.target, request.strength, request.fastMode, ui)
             })
         }
-        if (jobs.isEmpty()) return@coroutineScope BatchResult(false, "没有可处理的视频")
+        if (jobs.isEmpty()) return@coroutineScope BatchResult(false, "没有可处理的音视频")
 
         val totalDuration = jobs.sumOf { it.weightMs }.coerceAtLeast(1L).toDouble()
         val fractions = DoubleArray(jobs.size)
@@ -252,7 +263,17 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
             val ok = results.count { it }
             callbacks.log("")
             callbacks.log("全部完成：成功 $ok 个，失败 ${jobs.size - ok} 个，总耗时 ${elapsed(t0)}。")
-            if (ok > 0) callbacks.log("成品在 Movies/$outputFolderName 文件夹里。")
+            if (ok > 0) {
+                callbacks.log(
+                    when {
+                        customOutputTreeUri != null -> "成品已保存到设置的自定义文件夹。"
+                        outputFolderName.startsWith('.') -> "成品在 Movies/$outputFolderName 文件夹里。"
+                        request.files.all { it.isAudio } -> "成品在 Music/响度均衡 文件夹里。"
+                        request.files.none { it.isAudio } -> "成品在 Movies/响度均衡 文件夹里。"
+                        else -> "视频在 Movies/响度均衡，音频在 Music/响度均衡。"
+                    }
+                )
+            }
             BatchResult(ok > 0, "成功 $ok 个，失败 ${jobs.size - ok} 个")
         }
     }
@@ -362,6 +383,80 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         return target
     }
 
+    @Synchronized
+    private fun createCustomOutput(name: String, mimeType: String): Pair<DocumentFile, Uri> {
+        val treeUri = customOutputTreeUri ?: throw IllegalStateException("未设置自定义文件夹")
+        val directory = DocumentFile.fromTreeUri(appContext, treeUri)
+            ?: throw IllegalStateException("无法访问自定义保存文件夹，请在设置中重新选择")
+        if (!directory.canWrite()) throw IllegalStateException("自定义保存文件夹没有写入权限")
+        val cleanName = name.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+        val base = cleanName.substringBeforeLast('.', cleanName)
+        val extension = cleanName.substringAfterLast('.', "")
+        var candidate = cleanName
+        var number = 1
+        while (directory.findFile(candidate) != null) {
+            val suffix = if (extension.isEmpty()) "" else ".$extension"
+            candidate = "${base}_$number$suffix"
+            number++
+        }
+        val document = directory.createFile(mimeType, candidate)
+            ?: throw IllegalStateException("无法在自定义文件夹创建成品")
+        return document to document.uri
+    }
+
+    @Synchronized
+    private fun renameCustomOutput(document: DocumentFile, name: String): DocumentFile {
+        val treeUri = customOutputTreeUri ?: throw IllegalStateException("未设置自定义文件夹")
+        val directory = DocumentFile.fromTreeUri(appContext, treeUri)
+            ?: throw IllegalStateException("无法访问自定义保存文件夹")
+        val cleanName = name.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+        val base = cleanName.substringBeforeLast('.', cleanName)
+        val extension = cleanName.substringAfterLast('.', "")
+        var candidate = cleanName
+        var number = 1
+        while (directory.findFile(candidate) != null) {
+            val suffix = if (extension.isEmpty()) "" else ".$extension"
+            candidate = "${base}_$number$suffix"
+            number++
+        }
+        val renamedUri = try {
+            DocumentsContract.renameDocument(contentResolver, document.uri, candidate)
+        } catch (_: Exception) {
+            null
+        }
+        if (renamedUri != null) {
+            return DocumentFile.fromSingleUri(appContext, renamedUri)
+                ?: throw IllegalStateException("无法确认最终文件")
+        }
+        if (document.renameTo(candidate)) return document
+        throw IllegalStateException("无法写入最终文件名")
+    }
+
+    private fun encodeToCustomFolder(
+        outName: String,
+        mimeType: String,
+        logFn: (String) -> Unit,
+        finalName: (() -> String?)?,
+        encode: (String) -> FFmpegSession,
+    ): Boolean {
+        var document = createCustomOutput(outName, mimeType).first
+        try {
+            val output = FFmpegKitConfig.getSafParameterForWrite(appContext, document.uri)
+            val session = encode(output)
+            if (!ReturnCode.isSuccess(session.returnCode)) {
+                logFn("  失败：ffmpeg 处理出错：")
+                logFn("  " + session.getAllLogsAsString(2000).lines().takeLast(5).joinToString("\n  "))
+                document.delete()
+                return false
+            }
+            finalName?.invoke()?.let { document = renameCustomOutput(document, it) }
+            return true
+        } catch (e: Exception) {
+            document.delete()
+            throw e
+        }
+    }
+
     private fun encodeToHiddenFolder(
         outName: String,
         logFn: (String) -> Unit,
@@ -391,19 +486,29 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         outName: String,
         logFn: (String) -> Unit,
         finalName: (() -> String?)? = null,
+        isAudio: Boolean = false,
         encode: (String) -> FFmpegSession,
     ): Boolean {
+        val mimeType = if (isAudio) "audio/mp4" else "video/mp4"
+        if (customOutputTreeUri != null) {
+            return encodeToCustomFolder(outName, mimeType, logFn, finalName, encode)
+        }
         if (outputFolderName.startsWith('.')) {
             return encodeToHiddenFolder(outName, logFn, finalName, encode)
         }
         val values = ContentValues().apply {
             put(MediaStore.Video.Media.DISPLAY_NAME, outName)
-            put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
-            put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/$outputFolderName")
+            put(MediaStore.Video.Media.MIME_TYPE, mimeType)
+            put(
+                MediaStore.Video.Media.RELATIVE_PATH,
+                if (isAudio) "Music/$outputFolderName" else "Movies/$outputFolderName",
+            )
             put(MediaStore.Video.Media.IS_PENDING, 1)
         }
         val outUri = contentResolver.insert(
-            MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY), values
+            if (isAudio) MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+            else MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY),
+            values,
         )
         if (outUri == null) {
             logFn("  失败：无法写入相册")
@@ -451,6 +556,32 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         finalName: (() -> String?)? = null,
         onFraction: ((Double) -> Unit)? = null,
     ): Boolean {
+        if (customOutputTreeUri != null) {
+            var document = createCustomOutput(outName, "video/mp4").first
+            try {
+                val total = input.length().coerceAtLeast(1L).toDouble()
+                var copied = 0L
+                contentResolver.openOutputStream(document.uri)!!.buffered().use { target ->
+                    input.inputStream().buffered().use { source ->
+                        val buffer = ByteArray(1024 * 1024)
+                        while (true) {
+                            throwIfCancelled()
+                            val count = source.read(buffer)
+                            if (count < 0) break
+                            target.write(buffer, 0, count)
+                            copied += count
+                            onFraction?.invoke((copied / total).coerceIn(0.0, 1.0))
+                        }
+                    }
+                }
+                finalName?.invoke()?.let { document = renameCustomOutput(document, it) }
+                onFraction?.invoke(1.0)
+                return true
+            } catch (e: Exception) {
+                document.delete()
+                throw e
+            }
+        }
         if (outputFolderName.startsWith('.')) {
             var output = reserveHiddenOutputFile(outName)
             try {
@@ -1475,6 +1606,23 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         }
     }
 
+    private fun processAudioOne(
+        file: ProcessingInput,
+        target: Double,
+        strength: Double,
+        fastMode: Boolean,
+        ui: JobUi,
+    ): Boolean = processInput(
+        input = { FFmpegKitConfig.getSafParameterForRead(appContext, file.uri) },
+        name = file.name,
+        durationMs = sourceDurationMs(file),
+        target = target,
+        strength = strength,
+        fastMode = fastMode,
+        ui = ui,
+        isAudio = true,
+    )
+
     private fun processInput(
         input: () -> String,
         name: String,
@@ -1483,6 +1631,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         strength: Double,
         fastMode: Boolean,
         ui: JobUi,
+        isAudio: Boolean = false,
     ): Boolean {
         val duration = durationMs.coerceAtLeast(1L).toDouble()
         ui.stage("第 1 步 / 共 2 步：扫描响度…")
@@ -1544,15 +1693,17 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
             val filter = Engine.buildFilter(target, volume, measured) +
                 ",ebur128=metadata=1,ametadata=mode=print:file='$finalPath'"
             val base = cleanOutputBase(name)
+            val extension = if (isAudio) "m4a" else "mp4"
             var finalLoudness: Double? = null
             val done = encodeToGallery(
-                outName = "${base}_处理中.mp4",
+                outName = "${base}_处理中.$extension",
                 logFn = ui.log,
+                isAudio = isAudio,
                 finalName = {
                     finalLoudness = readFinalLoudness(finalMetadata)
                     finalLoudness?.let {
-                        String.format(java.util.Locale.US, "%s_%.2fLUFS.mp4", base, it)
-                    } ?: "${base}_响度未知.mp4"
+                        String.format(java.util.Locale.US, "%s_%.2fLUFS.%s", base, it, extension)
+                    } ?: "${base}_响度未知.$extension"
                 },
             ) { output ->
                 val args = ArrayList<String>()
@@ -1560,11 +1711,11 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
                     listOf(
                         "-hide_banner", "-y",
                         "-i", input(),
-                        "-map", "0:v?", "-map", "0:a:0",
-                        "-c:v", "copy",
+                        "-map", "0:a:0",
                         "-af", filter,
                     )
                 )
+                if (!isAudio) args.addAll(listOf("-map", "0:v?", "-c:v", "copy"))
                 args.addAll(aacArgs(fastMode))
                 args.addAll(listOf("-f", "mp4", output))
                 runFFmpeg(
