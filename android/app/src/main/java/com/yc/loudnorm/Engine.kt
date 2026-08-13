@@ -9,7 +9,7 @@ import kotlin.math.pow
 import kotlin.math.roundToInt
 
 /**
- * 响度均衡核心算法，负责响度扫描、分段和增益计算。
+ * 响度均衡核心算法，逐函数移植自电脑版 响度均衡.py。
  * 按响度把视频自动分段：小声段整段提升、大声段基本不动，
  * 段内自然起伏保留，增益切换藏在说话停顿处。
  */
@@ -21,7 +21,7 @@ object Engine {
     // 安全限幅器：只拦截分段增益后偶发的过载峰，不干预正常电平
     const val SEG_SAFETY = "alimiter=limit=0.891:level=false"
 
-    // 分段参数
+    // 分段参数（与电脑版一致）
     const val SEG_MIN_LEN = 8.0
     const val SEG_SPLIT_DB = 6.0
     const val SEG_SUSTAIN = 2.0
