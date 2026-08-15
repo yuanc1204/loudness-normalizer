@@ -23,6 +23,7 @@ import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.CheckBox
+import android.widget.EditText
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
@@ -66,7 +67,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cbConcat: CheckBox
 
     // inConcat：该视频是否被选入拼接组（勾选的视频合并成一个，按列表顺序）
-    private class PickedFile(val uri: Uri, val name: String, val isAudio: Boolean) {
+    private class PickedFile(val uri: Uri, var name: String, val isAudio: Boolean) {
         var inConcat = false
         var thumbnail: Bitmap? = null
         var thumbnailRequested = false
@@ -330,6 +331,7 @@ class MainActivity : AppCompatActivity() {
                 textSize = 13f
                 maxLines = 2
                 ellipsize = TextUtils.TruncateAt.END
+                setPadding((4 * dp).toInt(), (4 * dp).toInt(), (4 * dp).toInt(), (4 * dp).toInt())
                 layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
             }
             val cbCat = CheckBox(parent.context).apply {
@@ -355,6 +357,18 @@ class MainActivity : AppCompatActivity() {
         override fun onBindViewHolder(h: FileVH, position: Int) {
             val pf = picked[position]
             h.name.text = fileRowText(pf)
+            h.name.isEnabled = !busy && !pf.isAudio
+            h.name.isClickable = !busy && !pf.isAudio
+            h.name.setTextColor(if (pf.isAudio) 0xFF424242.toInt() else 0xFF6750A4.toInt())
+            h.name.setBackgroundResource(
+                if (pf.isAudio) 0 else android.R.drawable.list_selector_background
+            )
+            h.name.contentDescription = if (pf.isAudio) pf.name else "点击修改成品文件名：${pf.name}"
+            h.name.tooltipText = if (pf.isAudio) null else "点击修改成品文件名"
+            h.name.setOnClickListener {
+                val current = picked.getOrNull(h.bindingAdapterPosition) ?: return@setOnClickListener
+                if (!busy && !current.isAudio) showRenameDialog(current)
+            }
             val thumbnail = pf.thumbnail
             if (pf.isAudio) {
                 h.preview.setImageResource(android.R.drawable.ic_lock_silent_mode_off)
@@ -485,9 +499,51 @@ class MainActivity : AppCompatActivity() {
 
     private fun fileRowText(pf: PickedFile): String {
         if (pf.isAudio) return "${pf.name}\n音频"
-        val ranges = pf.clipRanges ?: return pf.name
+        val title = "✎ ${pf.name}"
+        val ranges = pf.clipRanges ?: return "$title\n点击标题可修改成品名称"
         val kept = ranges.sumOf { it.durationMs }
-        return "${pf.name}\n已裁剪：保留 ${ranges.size} 段 · ${formatShortTime(kept)}"
+        return "$title\n已裁剪：保留 ${ranges.size} 段 · ${formatShortTime(kept)} · 点标题改名"
+    }
+
+    private fun showRenameDialog(pf: PickedFile) {
+        if (busy || pf.isAudio || picked.indexOf(pf) < 0) return
+        val extension = pf.name.substringAfterLast('.', "")
+        val currentBase = pf.name.substringBeforeLast('.', pf.name)
+        val padding = (20 * resources.displayMetrics.density).toInt()
+        val input = EditText(this).apply {
+            setText(currentBase)
+            selectAll()
+            setSingleLine(true)
+            hint = "成品名称"
+            filters = arrayOf(android.text.InputFilter.LengthFilter(100))
+            setPadding(padding, padding / 2, padding, padding / 2)
+        }
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("修改成品名称")
+            .setMessage("只修改生成视频的名称前缀，不会改动原视频；最终文件名仍会附加响度信息。")
+            .setView(input)
+            .setNegativeButton("取消", null)
+            .setPositiveButton("保存", null)
+            .create()
+        dialog.setOnShowListener {
+            dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
+                val newBase = input.text.toString().trim()
+                when {
+                    newBase.isEmpty() -> input.error = "名称不能为空"
+                    newBase.any { it < ' ' || it in "\\/:*?\"<>|" } ->
+                        input.error = "不能包含 \\ / : * ? \" < > |"
+                    newBase.endsWith('.') -> input.error = "名称不能以句点结尾"
+                    else -> {
+                        pf.name = if (extension.isEmpty()) newBase else "$newBase.$extension"
+                        val position = picked.indexOf(pf)
+                        if (position >= 0) fileAdapter.notifyItemChanged(position)
+                        dialog.dismiss()
+                    }
+                }
+            }
+        }
+        dialog.show()
+        dialog.window?.setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE)
     }
 
     private fun showClipEditor(pf: PickedFile) {
