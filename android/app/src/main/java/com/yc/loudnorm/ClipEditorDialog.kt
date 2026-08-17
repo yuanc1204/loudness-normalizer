@@ -402,7 +402,7 @@ fun showClipEditorDialog(
         reset.isEnabled = ranges.size != 1 || ranges[0] != ClipRange(0L, durationMs)
         play.isEnabled = !videoFailed
         setCover.isEnabled = selected != null
-        coverStatus.text = coverPositionMs?.let { "已选成品封面：${formatClipTime(it)}（点完成后保存）" }
+        coverStatus.text = coverPositionMs?.let { "已选成品封面：${formatClipTime(it)}（快速取附近关键帧）" }
             ?: "未自选封面"
         play.text = when {
             videoFailed -> "无法播放"
@@ -502,7 +502,7 @@ fun showClipEditorDialog(
             (durationMs - VIDEO_COVER_LEAD_MS).coerceAtLeast(0L)
         )
         refreshUi()
-        Toast.makeText(context, "已选择此帧，点“完成”后写入成品封面", Toast.LENGTH_SHORT).show()
+        Toast.makeText(context, "已选择此位置，成品将快速采用附近关键帧", Toast.LENGTH_SHORT).show()
     }
 
     split.setOnClickListener {

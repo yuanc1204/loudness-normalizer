@@ -4,7 +4,9 @@ import android.content.ContentValues
 import android.content.Context
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaCodec
 import android.media.MediaMetadataRetriever
+import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Environment
 import android.provider.DocumentsContract
@@ -23,6 +25,7 @@ import kotlinx.coroutines.sync.withPermit
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
@@ -1148,6 +1151,186 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         return output
     }
 
+    /**
+     * 把源视频中离选择位置最近的关键帧复制到轨道开头，其余音视频样本原样搬运。
+     * 不解码、不重编码画面；首个视频样本与原音频之间留出极短间隔作为相册封面。
+     */
+    private fun createFastCoverInput(
+        source: () -> MediaExtractor,
+        coverPositionMs: Long,
+        durationMs: Long,
+        ui: JobUi,
+        onFraction: (Double) -> Unit,
+    ): File? {
+        val output = File(cacheDir, "cover_${System.nanoTime()}.mp4")
+        var muxer: MediaMuxer? = null
+        var muxerStarted = false
+        var completed = false
+        try {
+            val formatExtractor = source()
+            val selectedTracks = ArrayList<Int>()
+            var videoTrack = -1
+            val formats = LinkedHashMap<Int, MediaFormat>()
+            try {
+                for (index in 0 until formatExtractor.trackCount) {
+                    val format = formatExtractor.getTrackFormat(index)
+                    val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+                    if (mime.startsWith("video/") && videoTrack < 0) {
+                        videoTrack = index
+                        selectedTracks.add(index)
+                        formats[index] = format
+                    } else if (mime.startsWith("audio/") &&
+                        formats.values.none {
+                            it.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
+                        }
+                    ) {
+                        selectedTracks.add(index)
+                        formats[index] = format
+                    }
+                }
+            } finally {
+                formatExtractor.release()
+            }
+            if (videoTrack < 0 || selectedTracks.isEmpty()) {
+                ui.log("  失败：没有找到可复制的视频轨道。")
+                return null
+            }
+            val bufferSize = formats.values.maxOfOrNull { format ->
+                if (format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
+                    format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)
+                } else 1024 * 1024
+            }?.times(2)?.coerceIn(1024 * 1024, 32 * 1024 * 1024) ?: 4 * 1024 * 1024
+            val sampleBuffer = ByteBuffer.allocateDirect(bufferSize)
+
+            val coverExtractor = source()
+            val coverInfo = MediaCodec.BufferInfo()
+            try {
+                coverExtractor.selectTrack(videoTrack)
+                coverExtractor.seekTo(
+                    coverPositionMs.coerceAtLeast(0L) * 1000L,
+                    MediaExtractor.SEEK_TO_CLOSEST_SYNC,
+                )
+                val coverSize = coverExtractor.readSampleData(sampleBuffer, 0)
+                if (coverSize <= 0 || coverExtractor.sampleTrackIndex != videoTrack) {
+                    ui.log("  失败：所选位置附近没有可用的关键帧。")
+                    return null
+                }
+                coverInfo.set(0, coverSize, 0L, coverExtractor.sampleFlags)
+            } finally {
+                coverExtractor.release()
+            }
+
+            val activeMuxer = MediaMuxer(
+                output.absolutePath,
+                MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4,
+            )
+            muxer = activeMuxer
+            val muxTracks = LinkedHashMap<Int, Int>()
+            for ((sourceTrack, format) in formats) {
+                muxTracks[sourceTrack] = activeMuxer.addTrack(format)
+            }
+            formats[videoTrack]?.let { videoFormat ->
+                if (videoFormat.containsKey(MediaFormat.KEY_ROTATION)) {
+                    activeMuxer.setOrientationHint(videoFormat.getInteger(MediaFormat.KEY_ROTATION))
+                }
+            }
+            activeMuxer.start()
+            muxerStarted = true
+            sampleBuffer.position(0)
+            sampleBuffer.limit(coverInfo.size)
+            activeMuxer.writeSampleData(muxTracks.getValue(videoTrack), sampleBuffer, coverInfo)
+
+            val copyExtractor = source()
+            val copyInfo = MediaCodec.BufferInfo()
+            try {
+                selectedTracks.forEach(copyExtractor::selectTrack)
+                while (true) {
+                    throwIfCancelled()
+                    val track = copyExtractor.sampleTrackIndex
+                    if (track < 0) break
+                    sampleBuffer.clear()
+                    val size = copyExtractor.readSampleData(sampleBuffer, 0)
+                    if (size < 0) break
+                    copyInfo.set(
+                        0,
+                        size,
+                        copyExtractor.sampleTime.coerceAtLeast(0L) +
+                            VIDEO_COVER_LEAD_MS * 1000L,
+                        copyExtractor.sampleFlags,
+                    )
+                    sampleBuffer.position(0)
+                    sampleBuffer.limit(size)
+                    muxTracks[track]?.let { muxTrack ->
+                        activeMuxer.writeSampleData(muxTrack, sampleBuffer, copyInfo)
+                    }
+                    if (durationMs > 0L) {
+                        onFraction(
+                            (copyExtractor.sampleTime / 1000.0 / durationMs).coerceIn(0.0, 1.0)
+                        )
+                    }
+                    copyExtractor.advance()
+                }
+            } finally {
+                copyExtractor.release()
+            }
+            activeMuxer.stop()
+            muxerStarted = false
+            activeMuxer.release()
+            muxer = null
+            onFraction(1.0)
+            completed = output.exists() && output.length() > 0L
+            return output.takeIf { completed }
+        } catch (e: Exception) {
+            ui.log("  失败：此视频无法快速写入封面，不会改用慢速重编码：${e.message ?: "未知错误"}")
+            return null
+        } finally {
+            if (muxerStarted) {
+                try {
+                    muxer?.stop()
+                } catch (_: Exception) {
+                }
+            }
+            try {
+                muxer?.release()
+            } catch (_: Exception) {
+            }
+            if (!completed) output.delete()
+        }
+    }
+
+    private fun createFastCoverInput(
+        file: ProcessingInput,
+        ui: JobUi,
+        onFraction: (Double) -> Unit,
+    ): File? {
+        val coverPositionMs = file.coverPositionMs ?: return null
+        return createFastCoverInput(
+            source = {
+                MediaExtractor().apply {
+                    setDataSource(appContext, file.uri, null)
+                }
+            },
+            coverPositionMs = coverPositionMs,
+            durationMs = sourceDurationMs(file),
+            ui = ui,
+            onFraction = onFraction,
+        )
+    }
+
+    private fun createFastCoverInput(
+        sourceFile: File,
+        coverPositionMs: Long,
+        durationMs: Long,
+        ui: JobUi,
+        onFraction: (Double) -> Unit,
+    ): File? = createFastCoverInput(
+        source = { MediaExtractor().apply { setDataSource(sourceFile.absolutePath) } },
+        coverPositionMs = coverPositionMs,
+        durationMs = durationMs,
+        ui = ui,
+        onFraction = onFraction,
+    )
+
     private fun savePreparedVideo(
         input: File,
         outName: String,
@@ -1174,7 +1357,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
     private fun repairOne(file: ProcessingInput, fastMode: Boolean, ui: JobUi): Boolean {
         val duration = effectiveDurationMs(file).coerceAtLeast(1L)
         val base = file.name.substringBeforeLast('.')
-        if (file.clipRanges == null) {
+        if (file.clipRanges == null && file.coverPositionMs == null) {
             ui.stage("修复封装（无损，不重编码）…")
             return encodeToGallery("${base}_修复.mp4", ui.log) { output ->
                 runFFmpeg(
@@ -1188,6 +1371,26 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
                     ),
                     onTimeMs = { ms -> ui.progress(ms / duration) },
                 )
+            }
+        }
+
+        if (file.clipRanges == null && file.coverPositionMs != null) {
+            ui.stage("快速写入封面并修复封装（不重编码）…")
+            val covered = createFastCoverInput(file, ui) { fraction ->
+                ui.progress(0.8 * fraction)
+            } ?: return false
+            return try {
+                val saveUi = JobUi(ui.log, ui.stage) { fraction ->
+                    ui.progress(0.8 + 0.2 * fraction)
+                }
+                savePreparedVideo(
+                    covered,
+                    "${base}_修复.mp4",
+                    duration + VIDEO_COVER_LEAD_MS,
+                    saveUi,
+                )
+            } finally {
+                covered.delete()
             }
         }
 
@@ -1600,7 +1803,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
             val resolvedInfos = infos.filterNotNull()
             val reference = resolvedInfos.first()
             val canLosslessConcat = resolvedInfos.all { sameParams(reference, it) }
-            val needsRender = hasClipEdits || hasCustomCover || !canLosslessConcat
+            var needsRender = hasClipEdits || !canLosslessConcat
             val canvas = if (canLosslessConcat) null else canvasFor(reference)
             if (hasCustomCover) {
                 ui.log("  将第一个视频选定的画面写入拼接成品封面。")
@@ -1637,6 +1840,25 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
                             }
                         }
                     }
+                }
+            }
+
+            if (hasCustomCover && !needsRender) {
+                ui.stage("快速写入拼接成品封面（不重编码）…")
+                val firstFile = files.first()
+                val covered = createFastCoverInput(
+                    sourceFile = tempCopies.first(),
+                    coverPositionMs = firstFile.coverPositionMs!!,
+                    durationMs = sourceDurationMs(firstFile),
+                    ui = ui,
+                    onFraction = {},
+                )
+                if (covered != null) {
+                    tempCopies[0].delete()
+                    tempCopies[0] = covered
+                } else {
+                    ui.log("  失败：无法快速写入拼接封面，已停止；不会改用慢速重编码。")
+                    return false
                 }
             }
 
@@ -1715,8 +1937,15 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         }
 
         val trimWeight = 0.35
-        val trimmed = createTrimmedInput(file, fastMode, ui) { fraction ->
-            ui.progress(trimWeight * fraction)
+        val trimmed = if (file.clipRanges == null && file.coverPositionMs != null) {
+            ui.stage("快速写入封面（不重编码）…")
+            createFastCoverInput(file, ui) { fraction ->
+                ui.progress(trimWeight * fraction)
+            }
+        } else {
+            createTrimmedInput(file, fastMode, ui) { fraction ->
+                ui.progress(trimWeight * fraction)
+            }
         } ?: return false
         return try {
             val subUi = JobUi(ui.log, ui.stage) { fraction ->

@@ -15,7 +15,7 @@ If Android blocks the installation, follow the system prompt to allow your brows
 - Segment-based loudness normalization with adjustable target loudness and strength
 - Copy the original video stream when no trimming is required, avoiding video re-encoding
 - Preview, split, remove, reorder, and concatenate video segments
-- Set the current frame as the generated video's cover thumbnail
+- Pick a cover thumbnail for the generated video without re-encoding the full video when no other visual edits are needed
 - Rename the generated video by tapping its title
 - Export audio as M4A while preserving the source bitrate where possible to avoid unnecessary file-size growth
 - Background processing, progress notifications, cancellation, and cleanup of incomplete files
