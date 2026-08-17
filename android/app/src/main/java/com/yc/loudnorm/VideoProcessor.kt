@@ -28,12 +28,15 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.abs
 
+internal const val VIDEO_COVER_LEAD_MS = 120L
+
 /** 不依赖 Activity 的单个输入快照，可安全交给前台服务持有。 */
 data class ProcessingInput(
     val uriText: String,
     val name: String,
     val durationMs: Long,
     val clipRanges: List<ClipRange>?,
+    val coverPositionMs: Long?,
     val inConcat: Boolean,
     val isAudio: Boolean,
 ) {
@@ -74,6 +77,7 @@ data class ProcessingRequest(
                             }
                         })
                     }
+                    file.coverPositionMs?.let { put("coverPositionMs", it) }
                 })
             }
         })
@@ -102,6 +106,9 @@ data class ProcessingRequest(
                             name = item.getString("name"),
                             durationMs = item.optLong("durationMs", 0L),
                             clipRanges = ranges,
+                            coverPositionMs = if (item.has("coverPositionMs")) {
+                                item.getLong("coverPositionMs")
+                            } else null,
                             inConcat = item.optBoolean("inConcat", false),
                             isAudio = item.optBoolean("isAudio", false),
                         )
@@ -659,12 +666,50 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         pixelFormat: String,
         canvas: CanvasSpec?,
         normalizeAudio: Boolean,
+        coverPositionMs: Long?,
     ): String {
         require(rangesByInput.size == audioByInput.size)
         val filters = ArrayList<String>()
         val concatInputs = StringBuilder()
         val outputHasAudio = audioByInput.any { it }
         var segment = 0
+        if (coverPositionMs != null) {
+            val start = String.format(
+                java.util.Locale.US,
+                "%.3f",
+                coverPositionMs.coerceAtLeast(0L) / 1000.0,
+            )
+            val end = String.format(
+                java.util.Locale.US,
+                "%.3f",
+                (coverPositionMs.coerceAtLeast(0L) + VIDEO_COVER_LEAD_MS) / 1000.0,
+            )
+            val coverFilter = buildString {
+                append("[0:v:0]trim=start=$start:end=$end,setpts=PTS-STARTPTS")
+                if (canvas != null) {
+                    append(",scale=${canvas.width}:${canvas.height}:")
+                    append("force_original_aspect_ratio=decrease:force_divisible_by=2")
+                    append(",pad=${canvas.width}:${canvas.height}:")
+                    append("(ow-iw)/2:(oh-ih)/2:color=black,setsar=1")
+                }
+                append(",format=$pixelFormat[v$segment]")
+            }
+            filters.add(coverFilter)
+            concatInputs.append("[v$segment]")
+            if (outputHasAudio) {
+                val duration = String.format(
+                    java.util.Locale.US,
+                    "%.3f",
+                    VIDEO_COVER_LEAD_MS / 1000.0,
+                )
+                filters.add(
+                    "anullsrc=r=48000:cl=stereo,atrim=duration=$duration," +
+                        "asetpts=PTS-STARTPTS[a$segment]"
+                )
+                concatInputs.append("[a$segment]")
+            }
+            segment++
+        }
         for ((inputIndex, ranges) in rangesByInput.withIndex()) {
             for (range in ranges) {
                 val start = String.format(java.util.Locale.US, "%.3f", range.startMs / 1000.0)
@@ -732,12 +777,26 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         audioByInput: List<Boolean>,
         inputOffset: Int,
         outputLabel: String,
+        prependSilenceMs: Long = 0L,
     ): String {
         require(rangesByInput.size == audioByInput.size)
         require(audioByInput.any { it }) { "输入视频没有音轨" }
         val filters = ArrayList<String>()
         val concatInputs = StringBuilder()
         var segment = 0
+        if (prependSilenceMs > 0L) {
+            val duration = String.format(
+                java.util.Locale.US,
+                "%.3f",
+                prependSilenceMs / 1000.0,
+            )
+            filters.add(
+                "anullsrc=r=48000:cl=stereo,atrim=duration=$duration," +
+                    "asetpts=PTS-STARTPTS[a$segment]"
+            )
+            concatInputs.append("[a$segment]")
+            segment++
+        }
         for ((inputIndex, ranges) in rangesByInput.withIndex()) {
             for (range in ranges) {
                 val start = String.format(java.util.Locale.US, "%.3f", range.startMs / 1000.0)
@@ -775,6 +834,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         durationMs: Double,
         onProgress: (Double) -> Unit,
         logFn: (String) -> Unit,
+        prependSilenceMs: Long = 0L,
     ): List<Engine.Pt>? {
         val metadataFile = File(cacheDir, "scan_join_${System.nanoTime()}.txt")
         val metadataPath = metadataFile.absolutePath.replace("\\", "/").replace(":", "\\:")
@@ -783,7 +843,11 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
             args.addAll(listOf("-hide_banner", "-nostats"))
             for (provider in inputProviders) args.addAll(listOf("-i", provider()))
             val filter = buildConcatAudioFilter(
-                rangesByInput, audioByInput, inputOffset = 0, outputLabel = "ajoin"
+                rangesByInput,
+                audioByInput,
+                inputOffset = 0,
+                outputLabel = "ajoin",
+                prependSilenceMs = prependSilenceMs,
             ) + ";[ajoin]ebur128=peak=true:metadata=1," +
                 "ametadata=mode=print:file='$metadataPath'[ascan]"
             args.addAll(
@@ -819,6 +883,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         output: File,
         logFn: (String) -> Unit,
         onProgress: (Double) -> Unit,
+        coverPositionMs: Long?,
     ): Boolean {
         preciseVideoEncodeLock.acquire()
         val media3Result = try {
@@ -828,6 +893,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
                 width = canvas.width,
                 height = canvas.height,
                 videoBitrate = videoBitrate,
+                coverPositionMs = coverPositionMs,
                 output = output,
                 isCancelled = cancelRequested::get,
                 onProgress = onProgress,
@@ -850,6 +916,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         output: File,
         fastMode: Boolean,
         onTimeMs: ((Double) -> Unit)?,
+        prependSilenceMs: Long = 0L,
     ): FFmpegSession {
         val hasAudio = audioByInput.any { it }
         val args = ArrayList<String>()
@@ -857,7 +924,11 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         if (hasAudio) {
             for (provider in inputProviders) args.addAll(listOf("-i", provider()))
             val audioFilter = buildConcatAudioFilter(
-                rangesByInput, audioByInput, inputOffset = 1, outputLabel = "ajoin"
+                rangesByInput,
+                audioByInput,
+                inputOffset = 1,
+                outputLabel = "ajoin",
+                prependSilenceMs = prependSilenceMs,
             ) + ";[ajoin]${audioPostFilter ?: "anull"}[aout]"
             args.addAll(
                 listOf(
@@ -933,6 +1004,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         fastMode: Boolean,
         canvas: CanvasSpec?,
         normalizeAudio: Boolean,
+        coverPositionMs: Long?,
     ): Array<String> {
         val outputHasAudio = audioByInput.any { it }
         val pixelFormat = if (hardware) "nv12" else "yuv420p"
@@ -943,6 +1015,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
             listOf(
                 "-filter_complex", buildPreciseClipFilter(
                     rangesByInput, audioByInput, pixelFormat, canvas, normalizeAudio,
+                    coverPositionMs,
                 ),
                 "-map", "[vout]",
             )
@@ -995,6 +1068,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         onTimeMs: ((Double) -> Unit)?,
         canvas: CanvasSpec? = null,
         normalizeAudio: Boolean = false,
+        coverPositionMs: Long? = null,
     ): FFmpegSession {
         require(inputProviders.size == rangesByInput.size && inputProviders.size == audioByInput.size)
         preciseVideoEncodeLock.acquire()
@@ -1004,7 +1078,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
                 preciseClipArgs(
                     inputProviders, rangesByInput, audioByInput, videoBitrate, output,
                     hardware = true, fastMode = fastMode, canvas = canvas,
-                    normalizeAudio = normalizeAudio,
+                    normalizeAudio = normalizeAudio, coverPositionMs = coverPositionMs,
                 ),
                 onTimeMs = onTimeMs,
             )
@@ -1016,7 +1090,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
                 preciseClipArgs(
                     inputProviders, rangesByInput, audioByInput, videoBitrate, output,
                     hardware = false, fastMode = fastMode, canvas = canvas,
-                    normalizeAudio = normalizeAudio,
+                    normalizeAudio = normalizeAudio, coverPositionMs = coverPositionMs,
                 ),
                 onTimeMs = onTimeMs,
             )
@@ -1031,7 +1105,8 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         ui: JobUi,
         onFraction: (Double) -> Unit,
     ): File? {
-        val ranges = file.clipRanges ?: return null
+        if (file.clipRanges == null && file.coverPositionMs == null) return null
+        val ranges = clipRangesFor(file)
         val info = probeVideo(file.uri)
         if (info == null) {
             ui.log("  失败：无法识别视频编码参数，不能裁剪")
@@ -1039,7 +1114,13 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         }
         val keptDuration = ranges.sumOf { it.durationMs }.coerceAtLeast(1L).toDouble()
         val output = File(cacheDir, "trim_${System.nanoTime()}.mp4")
-        ui.stage("裁剪中：生成保留片段…")
+        ui.stage(
+            when {
+                file.clipRanges != null && file.coverPositionMs != null -> "裁剪并写入自选封面…"
+                file.coverPositionMs != null -> "正在写入自选封面…"
+                else -> "裁剪中：生成保留片段…"
+            }
+        )
         val session = try {
             runPreciseClip(
                 listOf { FFmpegKitConfig.getSafParameterForRead(appContext, file.uri) },
@@ -1050,13 +1131,15 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
                 fastMode,
                 ui.log,
                 onTimeMs = { ms -> onFraction((ms / keptDuration).coerceIn(0.0, 1.0)) },
+                normalizeAudio = file.coverPositionMs != null,
+                coverPositionMs = file.coverPositionMs,
             )
         } catch (e: Exception) {
             output.delete()
             throw e
         }
         if (!ReturnCode.isSuccess(session.returnCode) || !output.exists()) {
-            ui.log("  失败：裁剪视频时出错：")
+            ui.log("  失败：生成裁剪或封面视频时出错：")
             ui.log("  " + session.getAllLogsAsString(2000).lines().takeLast(6).joinToString("\n  "))
             output.delete()
             return null
@@ -1289,6 +1372,8 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
     ): Boolean = coroutineScope {
         val rangesByInput = files.map(::clipRangesFor)
         val audioByInput = infos.map { it.audioMime != null }
+        val coverPositionMs = files.firstOrNull()?.coverPositionMs
+        val coverLeadMs = if (coverPositionMs != null) VIDEO_COVER_LEAD_MS else 0L
         val videoBitrate = timelineVideoBitrate(infos, rangesByInput, canvas)
         val hasAudio = audioByInput.any { it }
         if (!repair && !hasAudio) {
@@ -1332,6 +1417,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
                     videoBitrate = videoBitrate,
                     output = video,
                     logFn = ui.log,
+                    coverPositionMs = coverPositionMs,
                     onProgress = { fraction ->
                         synchronized(progressLock) {
                             renderFraction = maxOf(renderFraction, fraction)
@@ -1354,6 +1440,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
                         updatePreparation()
                     },
                     logFn = ui.log,
+                    prependSilenceMs = coverLeadMs,
                 )
                 result to elapsed(startedAt)
             } else null
@@ -1430,6 +1517,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
                     audioPostFilter = audioFilter,
                     output = finalOutput,
                     fastMode = fastMode,
+                    prependSilenceMs = coverLeadMs,
                     onTimeMs = { ms ->
                         ui.progress(
                             finalBase + finalWeight * 0.85 *
@@ -1488,8 +1576,14 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         fastMode: Boolean,
         ui: JobUi,
     ): Boolean {
-        val totalDuration = files.sumOf { effectiveDurationMs(it) }.coerceAtLeast(1L).toDouble()
+        val coverLeadMs = if (files.firstOrNull()?.coverPositionMs != null) {
+            VIDEO_COVER_LEAD_MS
+        } else 0L
+        val totalDuration = (
+            files.sumOf { effectiveDurationMs(it) } + coverLeadMs
+        ).coerceAtLeast(1L).toDouble()
         val hasClipEdits = files.any { it.clipRanges != null }
+        val hasCustomCover = files.firstOrNull()?.coverPositionMs != null
         val outBase = files.first().name.substringBeforeLast('.') + "_等${files.size}个拼接"
         val stamp = System.currentTimeMillis()
         val listFile = File(cacheDir, "concat_$stamp.txt")
@@ -1506,8 +1600,11 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
             val resolvedInfos = infos.filterNotNull()
             val reference = resolvedInfos.first()
             val canLosslessConcat = resolvedInfos.all { sameParams(reference, it) }
-            val needsRender = hasClipEdits || !canLosslessConcat
+            val needsRender = hasClipEdits || hasCustomCover || !canLosslessConcat
             val canvas = if (canLosslessConcat) null else canvasFor(reference)
+            if (hasCustomCover) {
+                ui.log("  将第一个视频选定的画面写入拼接成品封面。")
+            }
             if (!canLosslessConcat) {
                 ui.log(
                     "  检测到分辨率或编码参数不同，将统一为 " +
@@ -1605,7 +1702,7 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         fastMode: Boolean,
         ui: JobUi,
     ): Boolean {
-        if (file.clipRanges == null) {
+        if (file.clipRanges == null && file.coverPositionMs == null) {
             return processInput(
                 { FFmpegKitConfig.getSafParameterForRead(appContext, file.uri) },
                 file.name,
@@ -1628,7 +1725,8 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
             processInput(
                 { trimmed.absolutePath },
                 file.name,
-                effectiveDurationMs(file),
+                effectiveDurationMs(file) +
+                    if (file.coverPositionMs != null) VIDEO_COVER_LEAD_MS else 0L,
                 target,
                 strength,
                 fastMode,

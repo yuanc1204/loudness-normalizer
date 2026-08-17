@@ -77,7 +77,8 @@ fun showClipEditorDialog(
     fileName: String,
     durationMs: Long,
     initialRanges: List<ClipRange>,
-    onApply: (List<ClipRange>) -> Unit,
+    initialCoverPositionMs: Long?,
+    onApply: (List<ClipRange>, Long?) -> Unit,
 ) {
     val dp = context.resources.displayMetrics.density
     fun Int.dp() = (this * dp).toInt()
@@ -94,6 +95,7 @@ fun showClipEditorDialog(
     val history = ArrayDeque<List<ClipRange>>()
     var selectedIndex = 0
     var currentMs = ranges.first().startMs
+    var coverPositionMs = initialCoverPositionMs
     var videoReady = false
     var videoFailed = false
 
@@ -143,6 +145,12 @@ fun showClipEditorDialog(
         gravity = Gravity.CENTER
         setPadding(0, 6.dp(), 0, 4.dp())
     }
+    val setCover = rowButton("此帧设为封面")
+    val coverStatus = TextView(context).apply {
+        textSize = 11f
+        gravity = Gravity.CENTER
+        setPadding(0, 0, 0, 3.dp())
+    }
     val timeline = SegmentTimelineView(context).apply {
         contentDescription = "裁剪时间轴，可拖动定位"
         layoutParams = LinearLayout.LayoutParams(
@@ -178,6 +186,14 @@ fun showClipEditorDialog(
         setPadding(12.dp(), 0, 12.dp(), 0)
         addView(previewBox)
         addView(timeText)
+        addView(
+            setCover,
+            LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+            )
+        )
+        addView(coverStatus)
         addView(
             TextView(context).apply {
                 text = "拖动时间轴定位。在不需要范围的两端分别点“分割”，再点蓝色片段并删除。"
@@ -344,6 +360,14 @@ fun showClipEditorDialog(
         }
     }
 
+    fun isPositionKept(positionMs: Long, keptRanges: List<ClipRange> = ranges): Boolean {
+        val position = positionMs.coerceIn(0L, durationMs)
+        return keptRanges.any { range ->
+            position >= range.startMs && (position < range.endMs ||
+                (position == durationMs && range.endMs == durationMs))
+        }
+    }
+
     fun pushHistory() {
         if (history.size >= 30) history.removeFirst()
         history.addLast(ranges.toList())
@@ -377,6 +401,9 @@ fun showClipEditorDialog(
         undo.isEnabled = history.isNotEmpty()
         reset.isEnabled = ranges.size != 1 || ranges[0] != ClipRange(0L, durationMs)
         play.isEnabled = !videoFailed
+        setCover.isEnabled = selected != null
+        coverStatus.text = coverPositionMs?.let { "已选成品封面：${formatClipTime(it)}（点完成后保存）" }
+            ?: "未自选封面"
         play.text = when {
             videoFailed -> "无法播放"
             video.isPlaying -> "暂停"
@@ -457,6 +484,25 @@ fun showClipEditorDialog(
             handler.post(updater)
         }
         refreshUi()
+    }
+
+    setCover.setOnClickListener {
+        if (video.isPlaying) {
+            currentMs = video.currentPosition.toLong().coerceIn(0L, durationMs)
+            video.pause()
+            handler.removeCallbacks(updater)
+            stillFrame.visibility = View.VISIBLE
+            requestStillFrame(currentMs)
+        }
+        if (!isPositionKept(currentMs)) {
+            Toast.makeText(context, "已删除位置不能设为封面", Toast.LENGTH_SHORT).show()
+            return@setOnClickListener
+        }
+        coverPositionMs = currentMs.coerceAtMost(
+            (durationMs - VIDEO_COVER_LEAD_MS).coerceAtLeast(0L)
+        )
+        refreshUi()
+        Toast.makeText(context, "已选择此帧，点“完成”后写入成品封面", Toast.LENGTH_SHORT).show()
     }
 
     split.setOnClickListener {
@@ -551,7 +597,8 @@ fun showClipEditorDialog(
             if (normalized.isEmpty()) {
                 Toast.makeText(context, "至少要保留一段视频", Toast.LENGTH_SHORT).show()
             } else {
-                onApply(normalized)
+                val retainedCover = coverPositionMs?.takeIf { isPositionKept(it, normalized) }
+                onApply(normalized, retainedCover)
                 dialog.dismiss()
             }
         }

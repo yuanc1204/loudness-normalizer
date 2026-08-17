@@ -15,6 +15,7 @@ If Android blocks the installation, follow the system prompt to allow your brows
 - Segment-based loudness normalization with adjustable target loudness and strength
 - Copy the original video stream when no trimming is required, avoiding video re-encoding
 - Preview, split, remove, reorder, and concatenate video segments
+- Set the current frame as the generated video's cover thumbnail
 - Rename the generated video by tapping its title
 - Export audio as M4A while preserving the source bitrate where possible to avoid unnecessary file-size growth
 - Background processing, progress notifications, cancellation, and cleanup of incomplete files
@@ -34,7 +35,7 @@ If Android blocks the installation, follow the system prompt to allow your brows
 1. Download the APK from the [latest release](https://github.com/yuanc1204/loudness-normalizer/releases/latest), install it, and open **Loudness Normalizer** (`响度均衡`).
 2. Tap **Select video or audio**. Media can also be shared directly to the app from Telegram and other apps.
 3. Adjust the target loudness and normalization strength if needed; the defaults work well for most recordings.
-4. Tap a video thumbnail to trim it, or select and reorder multiple videos for concatenation.
+4. Tap a video thumbnail to trim it or choose a frame for the generated video's cover. Multiple videos can also be selected and reordered for concatenation.
 5. Start processing and wait for scanning and output generation to finish. Source files are never modified.
 
 Default output locations:

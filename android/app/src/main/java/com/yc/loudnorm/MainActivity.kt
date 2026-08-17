@@ -73,6 +73,7 @@ class MainActivity : AppCompatActivity() {
         var thumbnailRequested = false
         var durationMs = 0L
         var clipRanges: List<ClipRange>? = null
+        var coverPositionMs: Long? = null
         var editRevision = 0
     }
 
@@ -419,11 +420,11 @@ class MainActivity : AppCompatActivity() {
         if (pf.thumbnailRequested) return
         pf.thumbnailRequested = true
         val revision = pf.editRevision
-        val hasEdits = pf.clipRanges != null
-        val previewAtMs = pf.clipRanges?.firstOrNull()?.startMs ?: 0L
+        val hasEdits = pf.clipRanges != null || pf.coverPositionMs != null
+        val previewAtMs = pf.coverPositionMs ?: pf.clipRanges?.firstOrNull()?.startMs ?: 0L
         lifecycleScope.launch {
             val bitmap = withContext(Dispatchers.IO) {
-                loadFfmpegThumbnail(pf.uri, previewAtMs)
+                loadFfmpegThumbnail(pf.uri, previewAtMs, pf.coverPositionMs != null)
             } ?: withContext(Dispatchers.IO) {
                 if (hasEdits) loadThumbnailFrame(pf.uri, previewAtMs)
                 else loadSystemThumbnail(pf.uri) ?: loadThumbnailFrame(pf.uri, -1L)
@@ -440,8 +441,12 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /** 每个任务只解码一个关键帧；显式线程池保证多个视频不会被系统抽帧器串行化。 */
-    private suspend fun loadFfmpegThumbnail(uri: Uri, positionMs: Long): Bitmap? =
+    /** 默认只解码关键帧；用户指定封面时准确解码当前帧，避免显示成附近的黑场。 */
+    private suspend fun loadFfmpegThumbnail(
+        uri: Uri,
+        positionMs: Long,
+        exactFrame: Boolean,
+    ): Bitmap? =
         suspendCancellableCoroutine { continuation ->
             val output = File(cacheDir, "thumb_${System.nanoTime()}.jpg")
             val seconds = String.format(
@@ -449,20 +454,24 @@ class MainActivity : AppCompatActivity() {
                 "%.3f",
                 positionMs.coerceAtLeast(0L) / 1000.0,
             )
-            val args = arrayOf(
-                "-hide_banner", "-loglevel", "error", "-y",
-                "-threads", "1",
-                "-skip_frame", "nokey",
-                "-ss", seconds,
-                "-i", FFmpegKitConfig.getSafParameterForRead(this, uri),
-                "-map", "0:v:0",
-                "-frames:v", "1",
-                "-an", "-sn",
-                "-vf", "scale=160:120:force_original_aspect_ratio=increase,crop=160:120",
-                "-c:v", "mjpeg", "-q:v", "5",
-                "-f", "image2", "-update", "1",
-                output.absolutePath,
-            )
+            val args = buildList {
+                addAll(listOf("-hide_banner", "-loglevel", "error", "-y", "-threads", "1"))
+                if (!exactFrame) addAll(listOf("-skip_frame", "nokey"))
+                addAll(listOf("-ss", seconds))
+                if (exactFrame) add("-accurate_seek")
+                addAll(
+                    listOf(
+                        "-i", FFmpegKitConfig.getSafParameterForRead(this@MainActivity, uri),
+                        "-map", "0:v:0",
+                        "-frames:v", "1",
+                        "-an", "-sn",
+                        "-vf", "scale=160:120:force_original_aspect_ratio=increase,crop=160:120",
+                        "-c:v", "mjpeg", "-q:v", "5",
+                        "-f", "image2", "-update", "1",
+                        output.absolutePath,
+                    )
+                )
+            }.toTypedArray()
             FFmpegKit.executeWithArgumentsAsync(args, { session ->
                 val bitmap = if (ReturnCode.isSuccess(session.returnCode) && output.exists()) {
                     BitmapFactory.decodeFile(output.absolutePath)
@@ -500,9 +509,11 @@ class MainActivity : AppCompatActivity() {
     private fun fileRowText(pf: PickedFile): String {
         if (pf.isAudio) return "${pf.name}\n音频"
         val title = "✎ ${pf.name}"
-        val ranges = pf.clipRanges ?: return "$title\n点击标题可修改成品名称"
+        val coverHint = if (pf.coverPositionMs != null) " · 已选成品封面" else ""
+        val ranges = pf.clipRanges
+            ?: return "$title\n点击标题可修改成品名称$coverHint"
         val kept = ranges.sumOf { it.durationMs }
-        return "$title\n已裁剪：保留 ${ranges.size} 段 · ${formatShortTime(kept)} · 点标题改名"
+        return "$title\n已裁剪：保留 ${ranges.size} 段 · ${formatShortTime(kept)}$coverHint · 点标题改名"
     }
 
     private fun showRenameDialog(pf: PickedFile) {
@@ -566,9 +577,17 @@ class MainActivity : AppCompatActivity() {
                 return@launch
             }
             val initial = pf.clipRanges ?: listOf(ClipRange(0L, duration))
-            showClipEditorDialog(this@MainActivity, pf.uri, pf.name, duration, initial) { ranges ->
+            showClipEditorDialog(
+                this@MainActivity,
+                pf.uri,
+                pf.name,
+                duration,
+                initial,
+                pf.coverPositionMs,
+            ) { ranges, coverPositionMs ->
                 val normalized = normalizeClipRanges(ranges, duration)
                 pf.clipRanges = if (isFullClip(normalized, duration)) null else normalized
+                pf.coverPositionMs = coverPositionMs
                 pf.editRevision++
                 pf.thumbnail?.recycle()
                 pf.thumbnail = null
@@ -744,6 +763,7 @@ class MainActivity : AppCompatActivity() {
                     name = file.name,
                     durationMs = sourceDurationMs(file),
                     clipRanges = file.clipRanges?.toList(),
+                    coverPositionMs = file.coverPositionMs,
                     inConcat = file.inConcat,
                     isAudio = file.isAudio,
                 )

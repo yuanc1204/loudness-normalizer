@@ -51,6 +51,7 @@ class FastVideoComposer(context: Context) {
         width: Int,
         height: Int,
         videoBitrate: Int,
+        coverPositionMs: Long?,
         output: File,
         isCancelled: () -> Boolean,
         onProgress: (Double) -> Unit,
@@ -67,6 +68,32 @@ class FastVideoComposer(context: Context) {
             }
             try {
                 val clips = buildList {
+                    if (coverPositionMs != null) {
+                        val coverClip = MediaItem.ClippingConfiguration.Builder()
+                            .setStartPositionMs(coverPositionMs)
+                            .setEndPositionMs(coverPositionMs + VIDEO_COVER_LEAD_MS)
+                            .build()
+                        val coverItem = MediaItem.Builder()
+                            .setUri(Uri.fromFile(inputs.first()))
+                            .setClippingConfiguration(coverClip)
+                            .build()
+                        val coverPresentation = Presentation.createForWidthAndHeight(
+                            width,
+                            height,
+                            Presentation.LAYOUT_SCALE_TO_FIT,
+                        )
+                        add(
+                            EditedMediaItem.Builder(coverItem)
+                                .setRemoveAudio(true)
+                                .setEffects(
+                                    Effects(
+                                        emptyList(),
+                                        listOf<Effect>(coverPresentation),
+                                    )
+                                )
+                                .build()
+                        )
+                    }
                     for ((inputIndex, ranges) in rangesByInput.withIndex()) {
                         for (range in ranges) {
                             val clipping = MediaItem.ClippingConfiguration.Builder()
