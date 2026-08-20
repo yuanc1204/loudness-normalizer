@@ -531,19 +531,40 @@ class MainActivity : AppCompatActivity() {
         }
         val dialog = AlertDialog.Builder(this)
             .setTitle("修改成品名称")
-            .setMessage("只修改生成视频的名称前缀，不会改动原视频；最终文件名仍会附加响度信息。")
+            .setMessage(
+                "只修改生成视频的名称前缀，不会改动原视频；最终文件名仍会附加响度信息。" +
+                    "名称中间可以有空格，开头和结尾的空格会自动去除。"
+            )
             .setView(input)
             .setNegativeButton("取消", null)
             .setPositiveButton("保存", null)
             .create()
         dialog.setOnShowListener {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
-                val newBase = input.text.toString().trim()
+                val rawBase = input.text.toString()
+                val newBase = rawBase.trim()
+                val forbiddenIndex = rawBase.indexOfFirst { it < ' ' || it in "\\/:*?\"<>|" }
+                fun showNameError(message: String, index: Int = 0) {
+                    input.error = message
+                    input.requestFocus()
+                    val start = index.coerceIn(0, rawBase.length)
+                    val end = (start + 1).coerceAtMost(rawBase.length)
+                    input.setSelection(start, end)
+                }
                 when {
-                    newBase.isEmpty() -> input.error = "名称不能为空"
-                    newBase.any { it < ' ' || it in "\\/:*?\"<>|" } ->
-                        input.error = "不能包含 \\ / : * ? \" < > |"
-                    newBase.endsWith('.') -> input.error = "名称不能以句点结尾"
+                    newBase.isEmpty() -> showNameError("名称不能为空")
+                    forbiddenIndex >= 0 -> {
+                        val invalid = rawBase[forbiddenIndex]
+                        val label = when (invalid) {
+                            '\t' -> "制表符"
+                            '\n' -> "换行符"
+                            '\r' -> "回车符"
+                            else -> invalid.toString()
+                        }
+                        showNameError("不能包含符号「$label」", forbiddenIndex)
+                    }
+                    newBase.endsWith('.') ->
+                        showNameError("名称不能以符号「.」结尾", rawBase.lastIndexOf('.'))
                     else -> {
                         pf.name = if (extension.isEmpty()) newBase else "$newBase.$extension"
                         val position = picked.indexOf(pf)
