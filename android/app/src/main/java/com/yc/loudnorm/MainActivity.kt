@@ -531,10 +531,6 @@ class MainActivity : AppCompatActivity() {
         }
         val dialog = AlertDialog.Builder(this)
             .setTitle("修改成品名称")
-            .setMessage(
-                "只修改生成视频的名称前缀，不会改动原视频；最终文件名仍会附加响度信息。" +
-                    "名称中间可以有空格，开头和结尾的空格会自动去除。"
-            )
             .setView(input)
             .setNegativeButton("取消", null)
             .setPositiveButton("保存", null)
