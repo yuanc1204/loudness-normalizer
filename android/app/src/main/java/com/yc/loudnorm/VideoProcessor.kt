@@ -356,19 +356,6 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
     private fun effectiveDurationMs(file: ProcessingInput): Long =
         file.clipRanges?.sumOf { it.durationMs } ?: sourceDurationMs(file)
 
-    /** 把原视频上的保留位置换算到裁剪后的连续时间轴。 */
-    private fun positionAfterClipping(positionMs: Long, ranges: List<ClipRange>): Long? {
-        var elapsedMs = 0L
-        for (range in ranges) {
-            if (positionMs >= range.startMs && positionMs < range.endMs) {
-                return elapsedMs + positionMs - range.startMs
-            }
-            elapsedMs += range.durationMs
-        }
-        val last = ranges.lastOrNull() ?: return null
-        return if (positionMs == last.endMs) elapsedMs.coerceAtLeast(1L) - 1L else null
-    }
-
     private fun elapsed(since: Long): String {
         val seconds = (System.currentTimeMillis() - since) / 1000L
         return if (seconds >= 60L) "${seconds / 60L} 分 ${seconds % 60L} 秒" else "$seconds 秒"
@@ -1121,62 +1108,74 @@ class VideoProcessor(context: Context, private val callbacks: ProcessingCallback
         ui: JobUi,
         onFraction: (Double) -> Unit,
     ): File? {
-        if (file.clipRanges == null && file.coverPositionMs == null) return null
-        val ranges = clipRangesFor(file)
+        val ranges = file.clipRanges ?: return file.coverPositionMs?.let {
+            createFastCoverInput(file, ui, onFraction)
+        }
         val info = probeVideo(file.uri)
         if (info == null) {
             ui.log("  失败：无法识别视频编码参数，不能裁剪")
             return null
         }
-        val keptDuration = ranges.sumOf { it.durationMs }.coerceAtLeast(1L).toDouble()
+        val keptDurationMs = ranges.sumOf { it.durationMs }.coerceAtLeast(1L)
+        val coverLeadMs = if (file.coverPositionMs != null) VIDEO_COVER_LEAD_MS else 0L
+        val totalDurationMs = keptDurationMs + coverLeadMs
+        val canvas = canvasFor(info)
+        val video = File(cacheDir, "trim_video_${System.nanoTime()}.mp4")
         val output = File(cacheDir, "trim_${System.nanoTime()}.mp4")
-        val addCoverAfterTrim = file.clipRanges != null && file.coverPositionMs != null
-        val trimShare = if (addCoverAfterTrim) 0.9 else 1.0
-        ui.stage("裁剪中：生成保留片段…")
-        val session = try {
-            runPreciseClip(
-                listOf { FFmpegKitConfig.getSafParameterForRead(appContext, file.uri) },
-                listOf(ranges),
-                listOf(info.audioMime != null),
-                info.bitrate,
-                output,
-                fastMode,
-                ui.log,
-                onTimeMs = { ms ->
-                    onFraction(trimShare * (ms / keptDuration).coerceIn(0.0, 1.0))
-                },
-            )
-        } catch (e: Exception) {
-            output.delete()
-            throw e
-        }
-        if (!ReturnCode.isSuccess(session.returnCode) || !output.exists()) {
-            ui.log("  失败：生成裁剪或封面视频时出错：")
-            ui.log("  " + session.getAllLogsAsString(2000).lines().takeLast(6).joinToString("\n  "))
-            output.delete()
-            return null
-        }
-        if (!addCoverAfterTrim) {
-            onFraction(1.0)
-            return output
-        }
+        var completed = false
+        try {
+            ui.stage("快速裁剪：系统硬件合成画面…")
+            preciseVideoEncodeLock.acquire()
+            val rendered = try {
+                fastVideoComposer.renderUris(
+                    inputs = listOf(file.uri),
+                    rangesByInput = listOf(ranges),
+                    width = canvas.width,
+                    height = canvas.height,
+                    videoBitrate = info.bitrate,
+                    coverPositionMs = file.coverPositionMs,
+                    output = video,
+                    isCancelled = cancelRequested::get,
+                    onProgress = { fraction -> onFraction(0.9 * fraction) },
+                )
+            } finally {
+                preciseVideoEncodeLock.release()
+            }
+            throwIfCancelled()
+            if (!rendered.success) {
+                ui.log("  失败：系统硬件裁剪不可用：${rendered.error ?: "未知原因"}")
+                ui.log("  已停止，不会改用耗时的 CPU 重编码。")
+                return null
+            }
 
-        val clippedCoverPositionMs = positionAfterClipping(file.coverPositionMs!!, ranges)
-        if (clippedCoverPositionMs == null) {
-            ui.log("  失败：自选封面不在裁剪后的保留片段内。")
-            output.delete()
-            return null
+            ui.stage("快速裁剪：写入音频并封装…")
+            val mux = runFinalTimelineMux(
+                video = video,
+                inputProviders = listOf {
+                    FFmpegKitConfig.getSafParameterForRead(appContext, file.uri)
+                },
+                rangesByInput = listOf(ranges),
+                audioByInput = listOf(info.audioMime != null),
+                audioPostFilter = null,
+                output = output,
+                fastMode = fastMode,
+                onTimeMs = { ms ->
+                    onFraction(0.9 + 0.1 * (ms / totalDurationMs).coerceIn(0.0, 1.0))
+                },
+                prependSilenceMs = coverLeadMs,
+            )
+            if (!ReturnCode.isSuccess(mux.returnCode) || !output.exists()) {
+                ui.log("  失败：裁剪后的音视频封装出错：")
+                ui.log("  " + mux.getAllLogsAsString(2000).lines().takeLast(6).joinToString("\n  "))
+                return null
+            }
+            onFraction(1.0)
+            completed = true
+            return output
+        } finally {
+            video.delete()
+            if (!completed) output.delete()
         }
-        ui.stage("快速写入自选封面（不重编码）…")
-        val covered = createFastCoverInput(
-            sourceFile = output,
-            coverPositionMs = clippedCoverPositionMs,
-            durationMs = keptDuration.toLong(),
-            ui = ui,
-            onFraction = { fraction -> onFraction(trimShare + (1.0 - trimShare) * fraction) },
-        )
-        output.delete()
-        return covered
     }
 
     /**

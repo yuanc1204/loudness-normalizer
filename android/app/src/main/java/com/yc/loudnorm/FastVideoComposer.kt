@@ -55,6 +55,29 @@ class FastVideoComposer(context: Context) {
         output: File,
         isCancelled: () -> Boolean,
         onProgress: (Double) -> Unit,
+    ): Result = renderUris(
+        inputs = inputs.map(Uri::fromFile),
+        rangesByInput = rangesByInput,
+        width = width,
+        height = height,
+        videoBitrate = videoBitrate,
+        coverPositionMs = coverPositionMs,
+        output = output,
+        isCancelled = isCancelled,
+        onProgress = onProgress,
+    )
+
+    /** 直接读取 ContentResolver Uri，单视频裁剪时无需先复制整个源文件。 */
+    fun renderUris(
+        inputs: List<Uri>,
+        rangesByInput: List<List<ClipRange>>,
+        width: Int,
+        height: Int,
+        videoBitrate: Int,
+        coverPositionMs: Long?,
+        output: File,
+        isCancelled: () -> Boolean,
+        onProgress: (Double) -> Unit,
     ): Result {
         require(inputs.size == rangesByInput.size)
         output.delete()
@@ -74,7 +97,7 @@ class FastVideoComposer(context: Context) {
                             .setEndPositionMs(coverPositionMs + VIDEO_COVER_LEAD_MS)
                             .build()
                         val coverItem = MediaItem.Builder()
-                            .setUri(Uri.fromFile(inputs.first()))
+                            .setUri(inputs.first())
                             .setClippingConfiguration(coverClip)
                             .build()
                         val coverPresentation = Presentation.createForWidthAndHeight(
@@ -101,7 +124,7 @@ class FastVideoComposer(context: Context) {
                                 .setEndPositionMs(range.endMs)
                                 .build()
                             val mediaItem = MediaItem.Builder()
-                                .setUri(Uri.fromFile(inputs[inputIndex]))
+                                .setUri(inputs[inputIndex])
                                 .setClippingConfiguration(clipping)
                                 .build()
                             val presentation = Presentation.createForWidthAndHeight(
