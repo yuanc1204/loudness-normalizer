@@ -112,11 +112,18 @@ class ProcessingService : Service() {
     private var wakeLock: PowerManager.WakeLock? = null
     private var processor: VideoProcessor? = null
     private var currentRunId = 0L
-    private var taskStartTimeMs = 0L
     private var lastNotificationAt = 0L
     private var pendingProgress = 0
     private var pendingText = "准备处理…"
     private var updateScheduled = false
+    private var etaStage = ""
+    private var etaStageStartedAt = 0L
+    private var etaStageStartProgress = 0
+    private var etaSampleAt = 0L
+    private var etaSampleProgress = 0
+    private var etaProgressPerMs = 0.0
+    private var etaRemainingMs: Long? = null
+    private var etaUpdatedAt = 0L
 
     private val flushProgress = Runnable {
         updateScheduled = false
@@ -156,7 +163,10 @@ class ProcessingService : Service() {
         val request = ProcessingRequest.fromJson(intent.getStringExtra(EXTRA_REQUEST))
         currentRunId = request?.runId ?: mutableState.value.runId
         isRunning = true
-        taskStartTimeMs = SystemClock.elapsedRealtime()
+        pendingProgress = 0
+        pendingText = "准备处理…"
+        etaStage = ""
+        etaRemainingMs = null
         wakeLock = getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "Loudnorm:Processing")
             .apply {
@@ -221,15 +231,50 @@ class ProcessingService : Service() {
             if (!isRunning) return@post
             pendingProgress = maxOf(pendingProgress, progress.coerceIn(0, 100))
 
-            val elapsedMs = SystemClock.elapsedRealtime() - taskStartTimeMs
-            val etaStr = if (pendingProgress in 5..98 && elapsedMs > 2000) {
-                val totalEstMs = elapsedMs * 100 / pendingProgress
-                val remSec = maxOf(0L, (totalEstMs - elapsedMs) / 1000)
+            val cleanText = if (text.contains(" (预估剩余")) text.substringBefore(" (预估剩余") else text
+            val now = SystemClock.elapsedRealtime()
+            if (cleanText != etaStage) {
+                etaStage = cleanText
+                etaStageStartedAt = now
+                etaStageStartProgress = pendingProgress
+                etaSampleAt = now
+                etaSampleProgress = pendingProgress
+                etaProgressPerMs = 0.0
+                etaRemainingMs = null
+                etaUpdatedAt = now
+            }
+
+            val sampleElapsedMs = now - etaSampleAt
+            val sampleProgress = pendingProgress - etaSampleProgress
+            if (sampleElapsedMs >= 1000L && sampleProgress > 0) {
+                val measuredRate = sampleProgress.toDouble() / sampleElapsedMs
+                etaProgressPerMs = if (etaProgressPerMs == 0.0) measuredRate
+                else etaProgressPerMs * 0.7 + measuredRate * 0.3
+                etaSampleAt = now
+                etaSampleProgress = pendingProgress
+            }
+
+            val stageElapsedMs = now - etaStageStartedAt
+            val stageProgress = pendingProgress - etaStageStartProgress
+            val canEstimate = pendingProgress in 1..98 && stageElapsedMs >= 5000L &&
+                stageProgress >= 3 && etaProgressPerMs > 0.0 && !cleanText.contains("取消")
+            if (canEstimate) {
+                // 首次按稳定阶段速率保守估算；同一阶段内只倒计，不反向增长。
+                val measuredRemainingMs = ((100 - pendingProgress) / etaProgressPerMs * 1.25)
+                    .toLong()
+                    .coerceAtMost(24L * 60L * 60L * 1000L)
+                val countedDownMs = etaRemainingMs?.let {
+                    (it - (now - etaUpdatedAt)).coerceAtLeast(0L)
+                }
+                etaRemainingMs = if (countedDownMs == null) measuredRemainingMs
+                else minOf(countedDownMs, measuredRemainingMs)
+                etaUpdatedAt = now
+            }
+            val etaStr = etaRemainingMs?.takeIf { canEstimate }?.let { remainingMs ->
+                val remSec = ((remainingMs + 999L) / 1000L).coerceAtLeast(1L)
                 if (remSec >= 60) " (预估剩余 ${remSec / 60}分${remSec % 60}秒)"
                 else " (预估剩余 ${remSec}秒)"
-            } else ""
-
-            val cleanText = if (text.contains(" (预估剩余")) text.substringBefore(" (预估剩余") else text
+            } ?: ""
             pendingText = if (etaStr.isNotEmpty() && !cleanText.contains("取消")) "$cleanText$etaStr" else cleanText
 
             mutableState.update { current ->
